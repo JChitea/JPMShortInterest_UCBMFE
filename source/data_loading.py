@@ -7,12 +7,6 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration constants
-DATA_FOLDER = Path('Short Interest Data')
-CRSP_FILE = Path('CRSP Market Data 2.csv')
-IBES_FILE = Path('IBES Recommendations.csv')
-COMPUSTAT_FILE = Path('Compustat Fundamentals.csv')
-
 # Tolerance settings
 RECOMMENDATION_TOLERANCE = pd.Timedelta(days=90)
 FUNDAMENTALS_TOLERANCE = pd.Timedelta(days=180)
@@ -225,7 +219,12 @@ def merge_with_tolerance(
     return merged_df
 
 
-def build_panel_dataset() -> Optional[pd.DataFrame]:
+def build_panel_dataset(
+    data_folder: Path = Path('Short Interest Data'),
+    crsp_file: Path = Path('CRSP Market Data 2.csv'),
+    ibes_file: Path = Path('IBES Recommendations.csv'),
+    compustat_file: Path = Path('Compustat Fundamentals.csv')
+) -> Optional[pd.DataFrame]:
     """
     Build the complete panel dataset by merging all data sources.
     
@@ -235,7 +234,7 @@ def build_panel_dataset() -> Optional[pd.DataFrame]:
     logger.info("Starting panel dataset construction...")
     
     # 1. Load short interest data
-    short_interest = merge_csvs_safely(DATA_FOLDER)
+    short_interest = merge_csvs_safely(data_folder)
     if short_interest is None:
         logger.error("Failed to load short interest data")
         return None
@@ -244,7 +243,7 @@ def build_panel_dataset() -> Optional[pd.DataFrame]:
     short_interest_clean = short_interest.rename(columns=SHORT_INTEREST_COLUMNS)
     
     # 2. Load CRSP data
-    crsp = load_and_prepare_crsp(CRSP_FILE)
+    crsp = load_and_prepare_crsp(crsp_file)
     if crsp is None:
         logger.error("Failed to load CRSP data")
         return None
@@ -259,7 +258,7 @@ def build_panel_dataset() -> Optional[pd.DataFrame]:
     )
     
     # 4. Load and merge recommendations
-    recommendations = load_and_aggregate_recommendations(IBES_FILE)
+    recommendations = load_and_aggregate_recommendations(ibes_file)
     if recommendations is not None:
         panel_data = merge_with_tolerance(
             panel_data,
@@ -273,7 +272,7 @@ def build_panel_dataset() -> Optional[pd.DataFrame]:
         logger.warning("Skipping recommendations merge due to load failure")
     
     # 5. Load and merge fundamentals
-    fundamentals = load_and_prepare_fundamentals(COMPUSTAT_FILE)
+    fundamentals = load_and_prepare_fundamentals(compustat_file)
     if fundamentals is not None:
         panel_data = merge_with_tolerance(
             panel_data,
@@ -290,11 +289,16 @@ def build_panel_dataset() -> Optional[pd.DataFrame]:
     return panel_data
 
 
-def main():
+def main(
+    data_folder: Path = Path('Short Interest Data'),
+    crsp_file: Path = Path('CRSP Market Data 2.csv'),
+    ibes_file: Path = Path('IBES Recommendations.csv'),
+    compustat_file: Path = Path('Compustat Fundamentals.csv')
+):
     """Main execution function."""
     try:
         # Build the complete panel dataset
-        panel_df = build_panel_dataset()
+        panel_df = build_panel_dataset(data_folder, crsp_file, ibes_file, compustat_file)
         
         if panel_df is not None:
             print("\n" + "="*50)
@@ -321,4 +325,5 @@ def main():
 
 
 if __name__ == "__main__":
+    
     merged_df = main()
