@@ -37,6 +37,11 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 import optuna
 import argparse
+import base64
+import json
+import os
+
+
 
 # ============================================================================
 # Configuration
@@ -56,6 +61,11 @@ CLAUDE_MAX_TOKENS = 52000
 # File Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FILE_PATH_BBG = os.path.join(SCRIPT_DIR, '..', 'data', 'BloombergJPM_noformula.xlsx')
+
+IN_IMAGES_DIR = "in_images"
+IN_TABULAR_DIR = "in_tabular"
+os.makedirs(IN_IMAGES_DIR, exist_ok=True)
+os.makedirs(IN_TABULAR_DIR, exist_ok=True)
 
 # Model Configuration
 DEFAULT_LAG_DAYS = 14  # Look-ahead bias prevention
@@ -298,6 +308,193 @@ def align_to_targets_with_lag(daily_df: pd.DataFrame,
 # ============================================================================
 # 3. FEATURE ENGINEERING
 # ============================================================================
+
+
+def _encode_image_to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+def _save_short_interest_plot(short_df: pd.DataFrame, short_stock: str) -> str:
+    path = os.path.join(IN_IMAGES_DIR, f"{short_stock}_short_interest.png")
+    plt.figure(figsize=(10, 6))
+    plt.plot(short_df.index, short_df["short_interest"], marker="o", alpha=0.8)
+    plt.title(f"{short_stock} - Short Interest")
+    plt.xlabel("Date")
+    plt.ylabel("Short Interest")
+    plt.grid(alpha=0.3)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    return path
+
+def _save_master_schema_json(daily_df: pd.DataFrame, stock_list: List[str], short_stock: str) -> str:
+    # Keep the prompt payload compact but informative
+    schema = {
+        "index_type": "DatetimeIndex",
+        "shape": [int(daily_df.shape[0]), int(daily_df.shape[1])],
+        "columns": list(daily_df.columns[:250]),  # cap to keep payload small
+        "dtypes_sample": {c: str(daily_df[c].dtype) for c in daily_df.columns[:150]},
+        "stocks_provided": stock_list,
+        "target_symbol": short_stock,
+        "notes": [
+            "Columns are prefixed by the originating ticker/index (e.g., AAPL_PX_LAST).",
+            "Daily frequency with possible missing days; use robust rolling ops.",
+            "Temporal leakage must be avoided; model pipeline applies a 14-day lag alignment."
+        ],
+    }
+    path = os.path.join(IN_TABULAR_DIR, f"{short_stock}_master_schema.json")
+    with open(path, "w") as f:
+        json.dump(schema, f, indent=2)
+    return path
+
+def _save_sample_column_plots(daily_df: pd.DataFrame, max_plots: int = 8) -> List[str]:
+    # Plot a representative subset of columns to keep the payload reasonable
+    cols = []
+    # Prioritize common, broad signals if present
+    for key in ["PX_LAST", "PX_VOLUME", "DVD_SH_LAST", "PX_BID", "PX_ASK", "OPEN_INT_TOTAL_PUT", "OPEN_INT_TOTAL_CALL"]:
+        candidates = [c for c in daily_df.columns if c.endswith(key)]
+        cols.extend(candidates[:2])
+    # Fill remaining slots with a few arbitrary columns
+    remaining = [c for c in daily_df.columns if c not in cols]
+    cols = (cols + remaining)[:max_plots]
+
+    paths = []
+    for c in cols:
+        path = os.path.join(IN_IMAGES_DIR, f"{c.replace('/', '_')}.png")
+        plt.figure(figsize=(10, 4))
+        plt.plot(daily_df.index, daily_df[c], alpha=0.8)
+        plt.title(c)
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close()
+        paths.append(path)
+    return paths
+
+def _build_claude_payload_from_files(
+    master_schema_json: str,
+    short_image_path: str,
+    feature_image_paths: List[str],
+    short_stock: str,
+    max_number_of_features: int = 8,
+    last_error: str = ""
+) -> dict:
+    with open(master_schema_json, "r") as f:
+        schema_text = f.read()
+
+    prompt = f"""
+Generate leakage-safe daily features for predicting the biweekly short interest of {short_stock}. 
+Constraints:
+- Output Python code ONLY, no explanation, inside a single module containing functions named feature_*.
+- Each function must accept a pandas.DataFrame df (daily master; DateTimeIndex; prefixed columns) and return a Series or DataFrame indexed daily.
+- Do NOT aggregate to the biweekly target; the training pipeline will align and lag features by 14 days to prevent lookahead.
+- Use only information available up to each day; avoid any target-aware transforms or label leakage.
+- Prefer robust transformations: rolling means/volatility, exponentially-weighted stats, cross-asset spreads, normalized flows, volatility regimes, etc.
+- Cap feature count to at most {max_number_of_features}. Keep columns well-named.
+
+Example function signature:
+def feature_rolling_realized_vol(df: pd.DataFrame) -> pd.DataFrame:
+    # return a daily DataFrame with stable, non-leaky rolling stats
+
+Important:
+- Handle missing data gracefully with ffill/bfill caps where reasonable, then compute.
+- Keep computation efficient; avoid O(n^2) operations or giant joins.
+- Columns should be simple ASCII names; avoid special characters.
+""".strip()
+
+    content = [{"type": "text", "text": prompt}]
+    # schema as text
+    content.append({"type": "text", "text": f"MASTER_SCHEMA_JSON:\n{schema_text}"})
+    # short interest plot
+    content.append({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": _encode_image_to_base64(short_image_path),
+        },
+    })
+    # representative feature images
+    for p in feature_image_paths:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": _encode_image_to_base64(p),
+            },
+        })
+    if last_error:
+        content.append({"type": "text", "text": f"PREVIOUS_ERROR_CONTEXT:\n{last_error}"})
+
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": min(CLAUDE_MAX_TOKENS, 4000),  # keep the reply focused on code
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": content}],
+    }
+    return payload
+
+def parse_response(response):
+
+    start = response.find("```python")
+    if start == -1:
+        start = response.find("```")
+        if start == -1:
+            print("No code block found in the response.")
+            return None
+        else:
+            end = response.find("```", start + 3)
+            code_block = response[start + 10:end].strip()
+    else:
+        end = response.find("```", start + 9)
+        code_block = response[start + 9:end].strip()
+    
+    # Now we need to save this code block as a python script
+    with open("generated_features.py", "w") as f:
+        f.write(code_block)
+        print('Saved generated_features.py')
+    
+    return code_block
+
+
+def _call_claude_and_write_generated_features(payload: dict) -> Optional[str]:
+    client = anthropic.Anthropic(api_key=CLAUDE_API)
+    full = ""
+    try:
+        with client.messages.stream(**payload) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+                full += text
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        return None
+    
+    code_block = parse_response(full)
+
+    return code_block
+
+
+def generate_llm_features(daily_df: pd.DataFrame, short_df: pd.DataFrame, stock_list: List[str], short_stock: str, max_features: int = 8, last_error: str = "") -> bool:
+    """
+    Returns True if generated_features.py is successfully written.
+    """
+    # Persist compact context
+    master_schema_json = _save_master_schema_json(daily_df, stock_list, short_stock)
+    short_plot_path = _save_short_interest_plot(short_df, short_stock)
+    feature_image_paths = _save_sample_column_plots(daily_df, max_plots=8)
+
+    # Build payload and call Claude
+    payload = _build_claude_payload_from_files(
+        master_schema_json,
+        short_plot_path,
+        feature_image_paths,
+        short_stock,
+        max_number_of_features=max_features,
+        last_error=last_error
+    )
+    code = _call_claude_and_write_generated_features(payload)
+    return code is not None
+
 
 def validate_feature(feature_df: pd.DataFrame, 
                      feature_name: str,
@@ -821,12 +1018,26 @@ def run_pipeline(stock_list: List[str],
     # 5. Generate features (with LLM if enabled)
     if use_llm and CLAUDE_API:
         print("\n5. Generating features with Claude API...")
-        # TODO: Add Claude API call logic here
-        print("   ⚠ LLM feature generation not implemented in refactored version")
+        try:
+            ok = generate_llm_features(
+                daily_df=daily_df,
+                short_df=short_df,
+                stock_list=stock_list,
+                short_stock=short_stock,
+                max_features=8,
+                last_error=""
+            )
+            if ok:
+                print(" ✓ LLM-generated features module written (generated_features.py)")
+            else:
+                print(" ✗ LLM generation failed; proceeding with raw features only")
+        except Exception as e:
+            print(f" ✗ LLM pipeline exception: {e}; proceeding with raw features only")
+    else:
+        print("\n5. Skipping LLM feature generation.")
 
     # 6. Create feature set
     print("\n6. Creating feature set...")
-    DEFAULT_LAG_DAYS = 1
     features_df = create_full_feature_set(daily_df, target_dates, lag_days=DEFAULT_LAG_DAYS)
     print(f"   Total features: {features_df.shape[1]}")
 
