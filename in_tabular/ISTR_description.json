@@ -1,0 +1,1 @@
+{"symbol": "ISTR", "columns": ["short_interest"], "dtypes": ["float64"], "shape": [186, 1]}
