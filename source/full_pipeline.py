@@ -1197,25 +1197,81 @@ def prep_with_medians(X: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
     Xf = Xf.reindex(columns=med.index)
     return Xf.fillna(med)
 
+def prune_features_smart(X_train: pd.DataFrame,
+                         y_train: pd.Series,
+                         nan_thresh: float = 0.60,
+                         min_unique: int = 4,
+                         corr_thresh: float = 0.92,
+                         max_features: int = 120) -> List[str]:
+    """
+    Intelligent feature selection based on:
+    1. Missing value ratio
+    2. Uniqueness
+    3. Correlation with target
+    4. Multicollinearity
+    """
+    # Step 1: Drop high-NaN columns
+    valid_cols = X_train.columns[X_train.isna().mean() < nan_thresh]
+    X = X_train[valid_cols]
+
+    # Step 2: Drop near-constant columns
+    valid_cols = [c for c in X.columns if X[c].nunique(dropna=True) >= min_unique]
+    X = X[valid_cols]
+
+    if len(X.columns) == 0:
+        return []
+
+    # Step 3: Rank by Spearman correlation with target
+    y_log = np.log1p(y_train)
+    scores = []
+    for col in X.columns:
+        try:
+            mask = ~(X[col].isna() | y_log.isna())
+            if mask.sum() < 8:
+                score = 0.0
+            else:
+                rho, _ = spearmanr(X.loc[mask, col], y_log[mask])
+                score = abs(rho) if not np.isnan(rho) else 0.0
+        except:
+            score = 0.0
+        scores.append((col, score))
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top_cols = [col for col, _ in scores[:max_features]]
+    X_ranked = X[top_cols]
+
+    # Step 4: Remove highly correlated features
+    X_filled = X_ranked.ffill().bfill().fillna(0)
+    corr_matrix = X_filled.corr().abs()
+    upper_tri = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+    upper_corr = corr_matrix.where(upper_tri)
+    drop_cols = [col for col in upper_corr.columns if any(upper_corr[col] > corr_thresh)]
+    final_cols = [c for c in X_ranked.columns if c not in drop_cols]
+
+    return final_cols[:max_features]
 
 def train_xgboost_with_optuna(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     n_trials: int = 100,
-    n_splits: int = N_CV_SPLITS
+    n_splits: int = N_CV_SPLITS,
+    use_pruning: bool = False
 ) -> Tuple[xgb.Booster, Dict, List[str], Optional[pd.Series]]:
+
     """
     Train XGBoost model with Optuna hyperparameter optimization.
-    
+
     Args:
         X_train: Training features
         y_train: Training target
         n_trials: Number of Optuna trials
         n_splits: Number of CV splits
-    
+        use_pruning: If True, apply feature pruning before training (default: False)
+
     Returns:
         (trained_model, best_params, kept_feature_columns, training_medians)
     """
+
     # Expanding-window CV
     min_train_size = int(len(X_train) * 0.6)
     step = max(1, (len(X_train) - min_train_size) // n_splits)
@@ -1230,9 +1286,20 @@ def train_xgboost_with_optuna(
     
     print(f"\n  Created {len(cv_splits)} expanding window CV splits")
     
-    # Use ALL features - no pruning
-    kept_cols = X_train.columns.tolist()
-    
+    if use_pruning:
+        print(f"\n Feature pruning ENABLED")
+        kept_cols = prune_features_smart(
+            X_train, y_train,
+            nan_thresh=0.40,
+            max_features=25
+        )
+    else:
+        print(f"\n ⚙ Feature pruning DISABLED - using all features")
+        kept_cols = X_train.columns.tolist()
+
+    # Keep safe target lags if present
+    must_keep = [c for c in X_train.columns if c in ['si_lag1', 'si_lag2', 'si_logdiff_lag1']]
+    kept_cols = list(dict.fromkeys(must_keep + kept_cols))
     # Display feature observation counts
     print("\n" + "="*90)
     print("FEATURE OBSERVATION COUNTS")
@@ -1563,7 +1630,8 @@ def run_pipeline(
     use_alpha_vantage: bool = False,
     n_trials: int = 100,
     n_passes: int = 3,
-    max_leakage_retries: int = 3
+    max_leakage_retries: int = 3,
+    use_pruning: bool = False
 ):
     """
     Execute short interest prediction pipeline.
@@ -1694,7 +1762,7 @@ def run_pipeline(
         # 7. Train model
         print(f"\n5.{p} Training model for pass {p}...")
         model, best_params, kept_cols, medians = train_xgboost_with_optuna(
-            X_train, y_train, n_trials=n_trials
+            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
         )
         
         # 8. Evaluate
@@ -1772,6 +1840,9 @@ Examples:
                        help='Optuna optimization trials (default: 100)')
     parser.add_argument('--n-passes', type=int, default=3,
                        help='Number of LLM feature generation passes (default: 3)')
+    parser.add_argument('--use-pruning', action='store_true',
+                        help='Enable feature pruning before training (default: disabled)')
+
     
     args = parser.parse_args()
     
@@ -1804,5 +1875,6 @@ Examples:
             use_images=args.use_images,
             use_alpha_vantage=args.use_alpha_vantage,
             n_trials=args.n_trials,
-            n_passes=args.n_passes
+            n_passes=args.n_passes,
+            use_pruning=args.use_pruning
         )
