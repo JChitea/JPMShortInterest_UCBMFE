@@ -1,4 +1,9 @@
 """
+# Available Market Indices:
+# - SPX: S&P 500 Index
+# - RUI: Russell 1000 Index
+# - RUA: Russell 3000 Index
+#
 Stock Short Interest Prediction Pipeline - Refactored with Image Support
 
 This pipeline predicts biweekly short interest using:
@@ -1712,21 +1717,27 @@ def run_pipeline(
                 feedback_md, must_keep, avoid = "", None, None
         
         # 10. Plot
-        val_size = max(3, int(0.2 * len(X_train)))
-        y_train_plot = y_train.iloc[:-val_size]
-        y_train_pred_plot = metrics["train_pred"][:-val_size] if len(metrics["train_pred"]) > val_size else metrics["train_pred"]
+        # val_size = max(3, int(0.2 * len(X_train)))
+        # y_train_plot = y_train.iloc[:-val_size]
+        # y_train_pred_plot = metrics["train_pred"][:-val_size] if len(metrics["train_pred"]) > val_size else metrics["train_pred"]
         
+        # plot_predictions(
+        #     y_train_plot,
+        #     y_train_pred_plot,
+        #     y_test,
+        #     metrics["test_pred"],
+        #     cutoff_date,
+        #     short_stock,
+        #     metrics,
+        #     save_path=f"{OUTPUT_DIR}/{short_stock}_predictions_pass{p}.png"
+        # )
         plot_predictions(
-            y_train_plot,
-            y_train_pred_plot,
-            y_test,
-            metrics["test_pred"],
-            cutoff_date,
-            short_stock,
-            metrics,
+            y_train, metrics['train_pred'],
+            y_test, metrics['test_pred'],
+            cutoff_date, short_stock, metrics,
             save_path=f"{OUTPUT_DIR}/{short_stock}_predictions_pass{p}.png"
         )
-    
+        
     # Cleanup
     if use_images:
         clear_generated_artifacts(stock_list, short_stock)
@@ -1765,18 +1776,33 @@ Examples:
     args = parser.parse_args()
     
     # User input
+# User input for market index
+    print("Available market indices: SPX (S&P 500), RUI (Russell 1000), RUA (Russell 3000)")
+    market_index = input("Enter market index to use (default: SPX): ").strip().upper()
+    if not market_index:
+        market_index = "SPX"
+    if market_index not in ["SPX", "RUI", "RUA"]:
+        print(f"Warning: {market_index} not recognized. Using SPX as default.")
+        market_index = "SPX"
+    print(f"Using market index: {market_index}\n")
+
     stock_list = input("Enter stock symbols separated by commas (e.g., AAPL,MSFT,GOOGL): ").split(',')
     stock_list = [s.strip().upper() for s in stock_list]
-    
-    short_stock = input("Enter stock to predict short interest for (e.g., TSLA): ").strip().upper()
-    
-    # Run pipeline
-    run_pipeline(
-        stock_list=stock_list,
-        short_stock=short_stock,
-        use_llm=args.use_llm,
-        use_images=args.use_images,
-        use_alpha_vantage=args.use_alpha_vantage,
-        n_trials=args.n_trials,
-        n_passes=args.n_passes
-    )
+
+# Add selected market index to stock list
+    if market_index not in stock_list:
+        stock_list.append(market_index)
+        print(f"Added {market_index} to feature stock list")
+        
+        short_stock = input("Enter stock to predict short interest for (e.g., TSLA): ").strip().upper()
+        
+        # Run pipeline
+        run_pipeline(
+            stock_list=stock_list,
+            short_stock=short_stock,
+            use_llm=args.use_llm,
+            use_images=args.use_images,
+            use_alpha_vantage=args.use_alpha_vantage,
+            n_trials=args.n_trials,
+            n_passes=args.n_passes
+        )
