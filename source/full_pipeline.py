@@ -1,15 +1,19 @@
 """
+
 # Available Market Indices:
 # - SPX: S&P 500 Index
 # - RUI: Russell 1000 Index
 # - RUA: Russell 3000 Index
-#
-Stock Short Interest Prediction Pipeline - Refactored with Image Support
+
+
+Stock Short Interest Prediction Pipeline - Dual Model (XGBoost + Ridge)
 
 This pipeline predicts biweekly short interest using:
 1. Daily market data (Bloomberg or Alpha Vantage)
 2. Optional LLM-generated features via Claude API
-3. XGBoost machine learning model with Optuna optimization
+3. TWO machine learning models with Optuna optimization:
+   - XGBoost (gradient boosting)
+   - Ridge Regression (linear model with L2 regularization)
 
 Usage:
     # Text-based mode (default, efficient)
@@ -25,7 +29,8 @@ Key Features:
 - 14-day lag alignment to prevent lookahead bias
 - Multi-pass LLM feature refinement with feedback
 - Expanding window cross-validation
-- Hyperparameter optimization via Optuna
+- Hyperparameter optimization via Optuna for BOTH models
+- Separate predictions and visualizations for XGBoost and Ridge
 """
 
 import argparse
@@ -48,9 +53,9 @@ import xgboost as xgb
 from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 from scipy.stats import spearmanr
+from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_squared_error, r2_score
 from tqdm import tqdm
-
 
 # ============================================================================
 # CONFIGURATION
@@ -85,7 +90,6 @@ DEFAULT_LAG_DAYS = 14  # Look-ahead bias prevention
 TEST_SIZE = 0.2
 N_CV_SPLITS = 5
 
-
 # ============================================================================
 # 1. DATA ACQUISITION
 # ============================================================================
@@ -106,7 +110,6 @@ def get_finra_auth() -> str:
     response.raise_for_status()
     return response.json()['access_token']
 
-
 def get_finra_short_data(symbol: str, date_range: List[Optional[str]] = [None, None]) -> pd.DataFrame:
     """
     Fetch biweekly short interest data from FINRA API.
@@ -117,7 +120,7 @@ def get_finra_short_data(symbol: str, date_range: List[Optional[str]] = [None, N
     
     Returns:
         DataFrame with DateTimeIndex and 'short_interest' column
-        
+    
     Note:
         - Saves visualization to outputs/{symbol}_short_interest.png
         - Saves metadata to in_tabular/{symbol}_description.json
@@ -190,7 +193,6 @@ def get_finra_short_data(symbol: str, date_range: List[Optional[str]] = [None, N
     
     return df
 
-
 def get_alpha_vantage_data(symbol: str, date_range: List[Optional[str]] = [None, None]) -> pd.DataFrame:
     """
     Fetch daily stock data from Alpha Vantage API.
@@ -201,7 +203,7 @@ def get_alpha_vantage_data(symbol: str, date_range: List[Optional[str]] = [None,
     
     Returns:
         DataFrame with DateTimeIndex and columns: open, high, low, close, adjusted_close, volume, etc.
-        
+    
     Note:
         Requires ALPHA_API key in .env file
     """
@@ -235,11 +237,9 @@ def get_alpha_vantage_data(symbol: str, date_range: List[Optional[str]] = [None,
     # Clean column names
     df.columns = [col.split('. ')[1] if '. ' in col else col for col in df.columns]
     df.columns = [col.replace(' ', '_') for col in df.columns]
-    
     df = df.astype(float).sort_index()
     
     return df
-
 
 def parse_bloomberg_excel(file_path: str, start_row: int = 1, start_col: int = 2) -> Dict[str, pd.DataFrame]:
     """
@@ -260,6 +260,7 @@ def parse_bloomberg_excel(file_path: str, start_row: int = 1, start_col: int = 2
         df = pd.read_csv(file_path, header=None)
     
     data_section = df.iloc[start_row:, start_col:]
+    
     expected_columns = [
         'Date', 'PX_LAST', 'PX_VOLUME', 'DVD_SH_LAST',
         'PX_BID', 'PX_ASK', 'OPEN_INT_TOTAL_PUT', 'OPEN_INT_TOTAL_CALL'
@@ -291,7 +292,7 @@ def parse_bloomberg_excel(file_path: str, start_row: int = 1, start_col: int = 2
             ticker_values.columns = expected_columns
         else:
             actual_cols = expected_columns[:n_cols] if n_cols <= len(expected_columns) else \
-                expected_columns + [f'Col_{j}' for j in range(len(expected_columns), n_cols)]
+                         expected_columns + [f'Col_{j}' for j in range(len(expected_columns), n_cols)]
             ticker_values.columns = actual_cols
         
         # Clean data
@@ -302,6 +303,7 @@ def parse_bloomberg_excel(file_path: str, start_row: int = 1, start_col: int = 2
             continue
         
         ticker_values = ticker_values[ticker_values['Date'].notna()]
+        
         if ticker_values.empty:
             continue
         
@@ -320,8 +322,7 @@ def parse_bloomberg_excel(file_path: str, start_row: int = 1, start_col: int = 2
     
     return result_dict
 
-
-def get_stock_data(ticker: str, file_path: str = FILE_PATH_BBG, 
+def get_stock_data(ticker: str, file_path: str = FILE_PATH_BBG,
                    use_alpha_vantage: bool = False) -> pd.DataFrame:
     """
     Get stock data from Bloomberg file or Alpha Vantage.
@@ -353,7 +354,6 @@ def get_stock_data(ticker: str, file_path: str = FILE_PATH_BBG,
     else:
         raise ValueError(f"Ticker '{ticker}' not found. Available: {list(all_data.keys())}")
 
-
 # ============================================================================
 # 2. DATA PREPROCESSING
 # ============================================================================
@@ -367,7 +367,7 @@ def create_daily_master_df(stock_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     
     Returns:
         Master DataFrame with columns prefixed by stock symbol (e.g., AAPL_PX_LAST)
-        
+    
     Note:
         - Forward-fills missing values with 5-day limit to avoid stale data
         - All stocks aligned to union of dates
@@ -375,8 +375,8 @@ def create_daily_master_df(stock_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     all_dates = pd.DatetimeIndex([])
     for df in stock_dict.values():
         all_dates = all_dates.union(df.index)
-    
     all_dates = all_dates.sort_values()
+    
     master_df = pd.DataFrame(index=all_dates)
     
     # Add stock data with prefixes
@@ -387,7 +387,6 @@ def create_daily_master_df(stock_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     
     master_df = master_df.dropna(how='all', axis=1)
     return master_df
-
 
 def align_to_targets_with_lag(daily_df: pd.DataFrame,
                                target_dates: pd.DatetimeIndex,
@@ -402,7 +401,7 @@ def align_to_targets_with_lag(daily_df: pd.DataFrame,
     
     Returns:
         DataFrame aligned to target dates, using data from lag_days before each target
-        
+    
     Example:
         For target date 2024-03-15 with lag_days=14:
         - Cutoff date: 2024-03-01
@@ -425,7 +424,6 @@ def align_to_targets_with_lag(daily_df: pd.DataFrame,
             aligned_rows.append(empty_row)
     
     return pd.concat(aligned_rows, axis=0)
-
 
 # ============================================================================
 # 3. IMAGE GENERATION (OPTIONAL)
@@ -466,11 +464,9 @@ def visualize_data_for_llm(daily_df: pd.DataFrame,
     # Copy short interest plot to in_images if it exists
     short_plot_src = f"{OUTPUT_DIR}/{short_stock}_short_interest.png"
     short_plot_dst = f"{IN_IMAGES_DIR}/{short_stock}_short_interest.png"
-    
     if os.path.exists(short_plot_src):
         import shutil
         shutil.copy(short_plot_src, short_plot_dst)
-
 
 def encode_image_to_base64(image_path: str) -> str:
     """
@@ -484,7 +480,6 @@ def encode_image_to_base64(image_path: str) -> str:
     """
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
-
 
 def build_image_dict(stock_list: List[str], short_stock: str) -> Dict[str, Dict]:
     """
@@ -512,7 +507,6 @@ def build_image_dict(stock_list: List[str], short_stock: str) -> Dict[str, Dict]
                 }
     
     return image_dict
-
 
 def clear_generated_artifacts(stock_list: List[str], short_stock: str) -> None:
     """
@@ -542,7 +536,6 @@ def clear_generated_artifacts(stock_list: List[str], short_stock: str) -> None:
                 except Exception as e:
                     print(f"Warning: Could not remove {file}: {e}")
 
-
 # ============================================================================
 # 4. LLM FEATURE GENERATION
 # ============================================================================
@@ -568,7 +561,7 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
             "Columns prefixed by ticker (e.g., AAPL_PX_LAST)",
             "Daily frequency with possible gaps",
             "Pipeline aligns features to biweekly targets with 14-day lag"
-        ],
+        ]
     }
     
     for c in cols:
@@ -582,6 +575,7 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
             p50 = float(s.median()) if n > 0 else None
             p99 = float(s.quantile(0.99)) if n > 0 else None
             stdev_63 = float(s.rolling(63, min_periods=20).std().median()) if n > 0 else None
+            
             summary["columns"].append({
                 "name": c, "dtype": dtype, "n_non_nan": n, "nan_ratio": round(nan_ratio, 4),
                 "p01": p01, "p50": p50, "p99": p99, "stdev_63": stdev_63
@@ -592,7 +586,6 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
             })
     
     return json.dumps(summary, ensure_ascii=False, indent=2)
-
 
 def _build_claude_payload(
     daily_df: pd.DataFrame,
@@ -622,13 +615,12 @@ def _build_claude_payload(
     Returns:
         Dict ready for Claude API
     """
-    
     # Optimized system prompt - CRITICAL: enforce "feature_" prefix
     system_constraints = f"""Generate {max_number_of_features} leakage-safe DAILY features for {short_stock} short interest prediction.
 
 {{
   "output_format": {{
-    "line_1": "# PLAN: {{\\"features\\":[...]}}", 
+    "line_1": "# PLAN: {{\\"features\\":[...]}}",
     "remaining": "Python functions named feature_* taking df→Series/DataFrame"
   }},
   "constraints": {{
@@ -641,7 +633,7 @@ def _build_claude_payload(
     "CRITICAL: All function names MUST start with 'feature_' (e.g., feature_price_momentum_5d)",
     "Use df.ffill() NOT fillna(method='ffill') - deprecated syntax causes errors",
     "Use df column names from schema",
-    "No MUST_KEEP redefinitions", 
+    "No MUST_KEEP redefinitions",
     "No AVOID recreations",
     "Low correlation with MUST_KEEP"
   ]
@@ -653,7 +645,7 @@ def feature_price_momentum_5d(df):
     return (close / close.rolling(5, min_periods=1).mean() - 1).fillna(0)
 
 Emit ONLY fenced Python code. No explanations."""
-
+    
     # Build user content with condensed structure
     parts = []
     
@@ -705,13 +697,11 @@ Emit ONLY fenced Python code. No explanations."""
         "temperature": 0.2,
         "messages": [
             {"role": "user", "content": content}
-        ],
+        ]
     }
-
 
 # Forbidden tokens for leakage detection
 FORBIDDEN_TOKENS = ["short_interest", "si_lag", "si_logdiff", "target", "label"]
-
 
 def static_leakage_guard(code: str) -> Tuple[bool, str]:
     """
@@ -746,7 +736,6 @@ def static_leakage_guard(code: str) -> Tuple[bool, str]:
     
     return True, ""
 
-
 def parse_response(response: str, out_file: str) -> Tuple[Optional[str], str]:
     """
     Extract Python code block from Claude response and save to file.
@@ -775,7 +764,7 @@ def parse_response(response: str, out_file: str) -> Tuple[Optional[str], str]:
             code_block = plan_match.group(0) + "\n\n" + code_block
     else:
         # Fallback to generic fence
-        start = response.find("```")
+        start = response.find("```python")
         end = response.find("```", start + 3) if start != -1 else -1
         code_block = response[start + 3:end].strip() if end != -1 else ""
         
@@ -811,7 +800,6 @@ def parse_response(response: str, out_file: str) -> Tuple[Optional[str], str]:
     
     return code_block, ""
 
-
 def call_claude_and_write_features(payload: dict, out_file: str) -> Tuple[Optional[str], str]:
     """
     Call Claude API and save generated code.
@@ -836,7 +824,6 @@ def call_claude_and_write_features(payload: dict, out_file: str) -> Tuple[Option
         return None, f"claude_error:{e}"
     
     return parse_response(full, out_file)
-
 
 def generate_llm_features(
     daily_df: pd.DataFrame,
@@ -888,8 +875,8 @@ def generate_llm_features(
     )
     
     code, err = call_claude_and_write_features(payload, out_file)
+    
     return (code is not None), (err or "")
-
 
 # ============================================================================
 # 5. FEATURE VALIDATION & EXECUTION
@@ -911,7 +898,6 @@ def _max_consecutive_unchanged(series: pd.Series) -> int:
     lengths = run_ids.groupby(run_ids).transform("size") if len(run_ids) else pd.Series([], dtype=int)
     lengths = lengths.where(~s.isna(), 0)
     return int(lengths.max() if len(lengths) else 0)
-
 
 def validate_feature(
     feature_df: pd.DataFrame,
@@ -977,7 +963,6 @@ def validate_feature(
     
     return True, ""
 
-
 def safe_execute_features(
     daily_df: pd.DataFrame,
     target_dates: pd.DatetimeIndex,
@@ -1028,7 +1013,7 @@ def safe_execute_features(
         
         if len(funcs) == 0:
             error_log.append(f"{feature_file}: No functions starting with 'feature_' found")
-            print(f"    ✗ No valid feature functions (must start with 'feature_')")
+            print(f"  ✗ No valid feature functions (must start with 'feature_')")
             continue
         
         for func in funcs:
@@ -1044,11 +1029,11 @@ def safe_execute_features(
                     error_log.append(f"{feature_file}:{func.__name__}: {msg}")
                     continue
                 
-                print(f"    ✓ {func.__name__}: {len(res.columns)} column(s)")
+                print(f"  ✓ {func.__name__}: {len(res.columns)} column(s)")
                 feature_dfs.append(res)
             except Exception as e:
                 error_log.append(f"{feature_file}:{func.__name__}: {e}")
-                print(f"    ✗ {func.__name__}: {e}")
+                print(f"  ✗ {func.__name__}: {e}")
     
     if not feature_dfs:
         return pd.DataFrame(), error_log
@@ -1056,11 +1041,9 @@ def safe_execute_features(
     # Combine and align
     all_features_daily = pd.concat(feature_dfs, axis=1)
     all_features_daily = all_features_daily.loc[:, ~all_features_daily.columns.duplicated()]
-    
     features_aligned = align_to_targets_with_lag(all_features_daily, target_dates, lag_days)
     
     return features_aligned, error_log
-
 
 def create_full_feature_set(
     daily_df: pd.DataFrame,
@@ -1083,8 +1066,8 @@ def create_full_feature_set(
     """
     # REMOVED: Raw features are no longer included
     # Only use LLM-generated engineered features
-    
     engineered_features = pd.DataFrame()
+    
     if feature_files:
         eng, errors = safe_execute_features(
             daily_df, target_dates, feature_files=feature_files, lag_days=lag_days
@@ -1099,9 +1082,7 @@ def create_full_feature_set(
     
     # Return only LLM features (deduplicate just in case)
     engineered_features = engineered_features.loc[:, ~engineered_features.columns.duplicated()]
-    
     return engineered_features
-
 
 def summarize_feedback_for_llm(
     gain_df: pd.DataFrame,
@@ -1126,6 +1107,7 @@ def summarize_feedback_for_llm(
     top_by_gain = gain_df.head(top_k)["feature"].tolist()
     top_by_perm = perm_df.head(top_k)["feature"].tolist()
     top_union = list(dict.fromkeys(top_by_gain + top_by_perm))
+    
     weak = perm_df.tail(max(5, min(15, len(perm_df)//4)))["feature"].tolist()
     
     # Find redundancy groups
@@ -1135,17 +1117,20 @@ def summarize_feedback_for_llm(
     if Xf.shape[1] > 1:
         cm = Xf.corr(method="spearman").abs()
         used = set()
+        
         for c in cm.columns:
             if c in used:
                 continue
             grp = [c]
             used.add(c)
+            
             for c2 in cm.columns:
                 if c2 in used:
                     continue
                 if cm.loc[c, c2] >= corr_thresh:
                     grp.append(c2)
                     used.add(c2)
+            
             if len(grp) > 1:
                 groups.append(grp)
     
@@ -1173,16 +1158,14 @@ def summarize_feedback_for_llm(
     
     return feedback_md, must_keep, avoid
 
-
 # ============================================================================
-# 6. MODEL TRAINING & EVALUATION
+# 6. MODEL TRAINING & EVALUATION (DUAL MODEL: XGBoost + Ridge)
 # ============================================================================
 
 def compute_medians(X: pd.DataFrame) -> pd.Series:
     """Compute median values for imputation (no lookahead bias)."""
     Xf = X.ffill()  # Only forward fill
     return Xf.median()
-
 
 def prep_with_medians(X: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
     """Prepare data using training medians (no lookahead bias)."""
@@ -1213,17 +1196,18 @@ def prune_features_smart(X_train: pd.DataFrame,
     # Step 1: Drop high-NaN columns
     valid_cols = X_train.columns[X_train.isna().mean() < nan_thresh]
     X = X_train[valid_cols]
-
+    
     # Step 2: Drop near-constant columns
     valid_cols = [c for c in X.columns if X[c].nunique(dropna=True) >= min_unique]
     X = X[valid_cols]
-
+    
     if len(X.columns) == 0:
         return []
-
+    
     # Step 3: Rank by Spearman correlation with target
     y_log = np.log1p(y_train)
     scores = []
+    
     for col in X.columns:
         try:
             mask = ~(X[col].isna() | y_log.isna())
@@ -1235,19 +1219,21 @@ def prune_features_smart(X_train: pd.DataFrame,
         except:
             score = 0.0
         scores.append((col, score))
-
+    
     scores.sort(key=lambda x: x[1], reverse=True)
     top_cols = [col for col, _ in scores[:max_features]]
     X_ranked = X[top_cols]
-
+    
     # Step 4: Remove highly correlated features
     X_filled = X_ranked.ffill().bfill().fillna(0)
     corr_matrix = X_filled.corr().abs()
+    
     upper_tri = np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
     upper_corr = corr_matrix.where(upper_tri)
     drop_cols = [col for col in upper_corr.columns if any(upper_corr[col] > corr_thresh)]
+    
     final_cols = [c for c in X_ranked.columns if c not in drop_cols]
-
+    
     return final_cols[:max_features]
 
 def train_xgboost_with_optuna(
@@ -1257,26 +1243,24 @@ def train_xgboost_with_optuna(
     n_splits: int = N_CV_SPLITS,
     use_pruning: bool = False
 ) -> Tuple[xgb.Booster, Dict, List[str], Optional[pd.Series]]:
-
     """
     Train XGBoost model with Optuna hyperparameter optimization.
-
+    
     Args:
         X_train: Training features
         y_train: Training target
         n_trials: Number of Optuna trials
         n_splits: Number of CV splits
         use_pruning: If True, apply feature pruning before training (default: False)
-
+    
     Returns:
         (trained_model, best_params, kept_feature_columns, training_medians)
     """
-
     # Expanding-window CV
     min_train_size = int(len(X_train) * 0.6)
     step = max(1, (len(X_train) - min_train_size) // n_splits)
-    cv_splits = []
     
+    cv_splits = []
     for i in range(n_splits):
         end = min(min_train_size + i * step, len(X_train) - 1)
         train_idx = np.arange(0, end)
@@ -1287,22 +1271,23 @@ def train_xgboost_with_optuna(
     print(f"\n  Created {len(cv_splits)} expanding window CV splits")
     
     if use_pruning:
-        print(f"\n Feature pruning ENABLED")
+        print(f"\n  🔧 Feature pruning ENABLED")
         kept_cols = prune_features_smart(
             X_train, y_train,
             nan_thresh=0.40,
             max_features=25
         )
     else:
-        print(f"\n ⚙ Feature pruning DISABLED - using all features")
+        print(f"\n  ⚙ Feature pruning DISABLED - using all features")
         kept_cols = X_train.columns.tolist()
-
+    
     # Keep safe target lags if present
     must_keep = [c for c in X_train.columns if c in ['si_lag1', 'si_lag2', 'si_logdiff_lag1']]
     kept_cols = list(dict.fromkeys(must_keep + kept_cols))
+    
     # Display feature observation counts
     print("\n" + "="*90)
-    print("FEATURE OBSERVATION COUNTS")
+    print("XGBOOST - FEATURE OBSERVATION COUNTS")
     print("="*90)
     print(f"{'Feature':<50} {'Total':>10} {'Non-Null':>10} {'Null':>10} {'Valid %':>10}")
     print("-"*90)
@@ -1315,25 +1300,23 @@ def train_xgboost_with_optuna(
         print(f"{col:<50} {total:>10} {non_null:>10} {null:>10} {valid_pct:>9.1f}%")
     
     print("="*90)
-    print(f"Total features to be used in training: {len(kept_cols)}")
+    print(f"Total features to be used in XGBoost training: {len(kept_cols)}")
     print("="*90 + "\n")
     
     X_train_pruned = X_train[kept_cols]
     
     def objective(trial):
         params = {
-            "objective": "reg:squarederror",
-            "eval_metric": "rmse",
-            "tree_method": "hist",
-            "seed": 42,
-            "eta": trial.suggest_float("eta", 0.03, 0.15, log=True),
-            "max_depth": trial.suggest_int("max_depth", 3, 6),
-            "min_child_weight": trial.suggest_int("min_child_weight", 4, 10),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.9),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
-            "gamma": trial.suggest_float("gamma", 0.1, 1.0),
-            "alpha": trial.suggest_float("alpha", 0.0, 3.0),
-            "lambda": trial.suggest_float("lambda", 0.5, 10.0),
+            'objective': 'reg:squarederror',
+            'tree_method': 'hist',
+            'max_depth': 2,  # Maximum depth 2-3
+            'min_child_weight': 10,  # Prevent overfitting
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'eta': 0.1,
+            'gamma': 1.0,  # Conservative splits
+            'alpha': 5.0,  # Strong L1
+            'lambda': 10.0,  # Strong L2
         }
         
         n_estimators = trial.suggest_int("n_estimators", 300, 1200)
@@ -1364,16 +1347,17 @@ def train_xgboost_with_optuna(
         
         return float(np.mean(rmses))
     
-    print("\n  Running Optuna optimization...")
+    print("\n  Running XGBoost Optuna optimization...")
     study = optuna.create_study(
         direction='minimize',
         sampler=optuna.samplers.TPESampler(seed=42)
     )
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     best_params = study.best_params
-    print(f"\n  Best CV RMSE: {study.best_value:.4f}")
-    print(f"  Best params: {best_params}")
+    
+    print(f"\n  ✓ Best CV RMSE: {study.best_value:.4f}")
+    print(f"    Best params: {best_params}")
     
     # Final fit with early stopping
     val_size = max(3, int(0.2 * len(X_train_pruned)))
@@ -1405,16 +1389,131 @@ def train_xgboost_with_optuna(
     
     return final_model, best_params, kept_cols, med_final
 
-
-def evaluate_model(model: xgb.Booster,
-                   X_train: pd.DataFrame,
-                   y_train: pd.Series,
-                   X_test: pd.DataFrame,
-                   y_test: pd.Series,
-                   kept_cols: List[str],
-                   medians: Optional[pd.Series]) -> Dict:
+def train_ridge_with_optuna(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    n_trials: int = 100,
+    n_splits: int = N_CV_SPLITS,
+    use_pruning: bool = False
+) -> Tuple[Ridge, Dict, List[str], Optional[pd.Series]]:
     """
-    Evaluate trained model on train and test sets.
+    Train Ridge Regression model with Optuna hyperparameter optimization.
+    
+    Args:
+        X_train: Training features
+        y_train: Training target
+        n_trials: Number of Optuna trials
+        n_splits: Number of CV splits
+        use_pruning: If True, apply feature pruning before training (default: False)
+    
+    Returns:
+        (trained_model, best_params, kept_feature_columns, training_medians)
+    """
+    # Expanding-window CV
+    min_train_size = int(len(X_train) * 0.6)
+    step = max(1, (len(X_train) - min_train_size) // n_splits)
+    
+    cv_splits = []
+    for i in range(n_splits):
+        end = min(min_train_size + i * step, len(X_train) - 1)
+        train_idx = np.arange(0, end)
+        val_idx = np.arange(end, min(end + step, len(X_train)))
+        if len(val_idx) > 0:
+            cv_splits.append((train_idx, val_idx))
+    
+    print(f"\n  Created {len(cv_splits)} expanding window CV splits")
+    
+    if use_pruning:
+        print(f"\n  🔧 Feature pruning ENABLED")
+        kept_cols = prune_features_smart(
+            X_train, y_train,
+            nan_thresh=0.40,
+            max_features=25
+        )
+    else:
+        print(f"\n  ⚙ Feature pruning DISABLED - using all features")
+        kept_cols = X_train.columns.tolist()
+    
+    # Keep safe target lags if present
+    must_keep = [c for c in X_train.columns if c in ['si_lag1', 'si_lag2', 'si_logdiff_lag1']]
+    kept_cols = list(dict.fromkeys(must_keep + kept_cols))
+    
+    # Display feature observation counts
+    print("\n" + "="*90)
+    print("RIDGE - FEATURE OBSERVATION COUNTS")
+    print("="*90)
+    print(f"{'Feature':<50} {'Total':>10} {'Non-Null':>10} {'Null':>10} {'Valid %':>10}")
+    print("-"*90)
+    
+    for col in kept_cols:
+        total = len(X_train[col])
+        non_null = int(X_train[col].notna().sum())
+        null = int(X_train[col].isna().sum())
+        valid_pct = (non_null / total * 100) if total > 0 else 0
+        print(f"{col:<50} {total:>10} {non_null:>10} {null:>10} {valid_pct:>9.1f}%")
+    
+    print("="*90)
+    print(f"Total features to be used in Ridge training: {len(kept_cols)}")
+    print("="*90 + "\n")
+    
+    X_train_pruned = X_train[kept_cols]
+    
+    def objective(trial):
+        # Ridge hyperparameters
+        alpha = trial.suggest_float("alpha", 0.001, 1000.0, log=True)
+        
+        rmses = []
+        
+        for train_idx, val_idx in cv_splits:
+            X_tr = X_train_pruned.iloc[train_idx]
+            y_tr = y_train.iloc[train_idx]
+            X_val = X_train_pruned.iloc[val_idx]
+            y_val = y_train.iloc[val_idx]
+            
+            med = compute_medians(X_tr)
+            X_tr_prep = prep_with_medians(X_tr, med)
+            X_val_prep = prep_with_medians(X_val, med)
+            
+            # Train Ridge
+            model = Ridge(alpha=alpha, random_state=42)
+            model.fit(X_tr_prep, y_tr)
+            
+            y_pred = model.predict(X_val_prep)
+            rmse = np.sqrt(mean_squared_error(y_val.values, y_pred))
+            rmses.append(rmse)
+        
+        return float(np.mean(rmses))
+    
+    print("\n  Running Ridge Optuna optimization...")
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42)
+    )
+    
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    best_params = study.best_params
+    
+    print(f"\n  ✓ Best CV RMSE: {study.best_value:.4f}")
+    print(f"    Best params: {best_params}")
+    
+    # Final fit on full training set
+    med_final = compute_medians(X_train_pruned)
+    X_train_prep = prep_with_medians(X_train_pruned, med_final)
+    
+    final_model = Ridge(alpha=best_params["alpha"], random_state=42)
+    final_model.fit(X_train_prep, y_train)
+    
+    return final_model, best_params, kept_cols, med_final
+
+def evaluate_xgboost(model: xgb.Booster,
+                     X_train: pd.DataFrame,
+                     y_train: pd.Series,
+                     X_test: pd.DataFrame,
+                     y_test: pd.Series,
+                     kept_cols: List[str],
+                     medians: Optional[pd.Series]) -> Dict:
+    """
+    Evaluate trained XGBoost model on train and test sets.
     
     Args:
         model: Trained XGBoost model
@@ -1445,7 +1544,7 @@ def evaluate_model(model: xgb.Booster,
     test_r2 = r2_score(y_test, y_test_pred)
     
     print("\n" + "="*60)
-    print("MODEL EVALUATION")
+    print("XGBOOST - MODEL EVALUATION")
     print("="*60)
     print(f"IN-SAMPLE (Train): RMSE={train_rmse:.4f}, R²={train_r2:.4f}")
     print(f"OUT-OF-SAMPLE (Test): RMSE={test_rmse:.4f}, R²={test_r2:.4f}")
@@ -1460,6 +1559,59 @@ def evaluate_model(model: xgb.Booster,
         "test_pred": y_test_pred
     }
 
+def evaluate_ridge(model: Ridge,
+                   X_train: pd.DataFrame,
+                   y_train: pd.Series,
+                   X_test: pd.DataFrame,
+                   y_test: pd.Series,
+                   kept_cols: List[str],
+                   medians: Optional[pd.Series]) -> Dict:
+    """
+    Evaluate trained Ridge model on train and test sets.
+    
+    Args:
+        model: Trained Ridge model
+        X_train: Training features
+        y_train: Training target
+        X_test: Test features
+        y_test: Test target
+        kept_cols: Selected feature columns
+        medians: Training medians for imputation
+    
+    Returns:
+        Dict with metrics and predictions
+    """
+    X_train_pruned = X_train[kept_cols]
+    X_test_pruned = X_test.reindex(columns=kept_cols)
+    
+    med = medians if medians is not None else compute_medians(X_train_pruned)
+    
+    X_train_prep = prep_with_medians(X_train_pruned, med)
+    X_test_prep = prep_with_medians(X_test_pruned, med)
+    
+    y_train_pred = model.predict(X_train_prep)
+    y_test_pred = model.predict(X_test_prep)
+    
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    print("\n" + "="*60)
+    print("RIDGE - MODEL EVALUATION")
+    print("="*60)
+    print(f"IN-SAMPLE (Train): RMSE={train_rmse:.4f}, R²={train_r2:.4f}")
+    print(f"OUT-OF-SAMPLE (Test): RMSE={test_rmse:.4f}, R²={test_r2:.4f}")
+    print("="*60 + "\n")
+    
+    return {
+        "train_rmse": train_rmse,
+        "train_r2": train_r2,
+        "train_pred": y_train_pred,
+        "test_rmse": test_rmse,
+        "test_r2": test_r2,
+        "test_pred": y_test_pred
+    }
 
 def compute_feature_importances(
     model: xgb.Booster,
@@ -1484,12 +1636,14 @@ def compute_feature_importances(
     # Gain importance
     gain_raw = model.get_score(importance_type="gain")
     col_map = {f: f for f in X_ref.columns}
+    
     gain = []
     for k, v in gain_raw.items():
         name = col_map.get(k, k)
         gain.append((name, float(v)))
     
     gain_df = pd.DataFrame(gain, columns=["feature", "gain"]).groupby("feature", as_index=False)["gain"].sum()
+    
     if gain_df["gain"].sum() > 0:
         gain_df["gain_norm"] = gain_df["gain"] / gain_df["gain"].sum()
     else:
@@ -1507,21 +1661,23 @@ def compute_feature_importances(
     
     drops = []
     rng = np.random.default_rng(42)
+    
     for feat in kept_cols:
         if feat not in Xh.columns:
             continue
+        
         drop_vals = []
         for _ in range(n_repeats):
             Xp = Xh.copy()
             Xp[feat] = rng.permutation(Xp[feat].values)
             r2p = r2_score(yh, model.predict(xgb.DMatrix(prep(Xp)), iteration_range=(0, model.best_iteration + 1)))
             drop_vals.append(base - r2p)
+        
         drops.append((feat, float(np.nanmean(drop_vals))))
     
     perm_df = pd.DataFrame(drops, columns=["feature", "perm_r2_drop"]).sort_values("perm_r2_drop", ascending=False)
     
     return gain_df.sort_values("gain_norm", ascending=False), perm_df
-
 
 # ============================================================================
 # 7. VISUALIZATION
@@ -1534,6 +1690,7 @@ def plot_predictions(y_train: pd.Series,
                      cutoff_date: pd.Timestamp,
                      symbol: str,
                      metrics: Dict,
+                     model_name: str,
                      save_path: str = "outputs/predictions.png"):
     """
     Create comprehensive prediction visualization.
@@ -1546,6 +1703,7 @@ def plot_predictions(y_train: pd.Series,
         cutoff_date: Train/test split date
         symbol: Stock symbol
         metrics: Evaluation metrics
+        model_name: Name of the model (e.g., "XGBoost", "Ridge")
         save_path: Path to save plot
     """
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -1564,7 +1722,7 @@ def plot_predictions(y_train: pd.Series,
                 alpha=0.7, label='Train/Test Split')
     ax1.set_xlabel('Date', fontsize=12, fontweight='bold')
     ax1.set_ylabel('Short Interest', fontsize=12, fontweight='bold')
-    ax1.set_title(f'{symbol} - Predictions Over Time', fontsize=14, fontweight='bold')
+    ax1.set_title(f'{symbol} - {model_name} Predictions Over Time', fontsize=14, fontweight='bold')
     ax1.legend(loc='best', fontsize=10)
     ax1.grid(True, alpha=0.3)
     
@@ -1577,7 +1735,7 @@ def plot_predictions(y_train: pd.Series,
     ax2.plot([min_val, max_val], [min_val, max_val], 'b--', lw=2, label='Perfect')
     ax2.set_xlabel('Actual', fontsize=12, fontweight='bold')
     ax2.set_ylabel('Predicted', fontsize=12, fontweight='bold')
-    ax2.set_title(f'In-Sample\nRMSE: {metrics["train_rmse"]:.4f}, R²: {metrics["train_r2"]:.4f}',
+    ax2.set_title(f'In-Sample ({model_name})\nRMSE: {metrics["train_rmse"]:.4f}, R²: {metrics["train_r2"]:.4f}',
                   fontsize=13, fontweight='bold', color='blue')
     ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
@@ -1591,7 +1749,7 @@ def plot_predictions(y_train: pd.Series,
     ax3.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2.5, label='Perfect')
     ax3.set_xlabel('Actual', fontsize=12, fontweight='bold')
     ax3.set_ylabel('Predicted', fontsize=12, fontweight='bold')
-    ax3.set_title(f'Out-of-Sample\nRMSE: {metrics["test_rmse"]:.4f}, R²: {metrics["test_r2"]:.4f}',
+    ax3.set_title(f'Out-of-Sample ({model_name})\nRMSE: {metrics["test_rmse"]:.4f}, R²: {metrics["test_r2"]:.4f}',
                   fontsize=13, fontweight='bold', color='red')
     ax3.legend(fontsize=10)
     ax3.grid(True, alpha=0.3)
@@ -1600,23 +1758,24 @@ def plot_predictions(y_train: pd.Series,
     ax4 = axes[1, 1]
     train_residuals = y_train.values - y_train_pred
     test_residuals = y_test.values - y_test_pred
+    
     bp = ax4.boxplot([train_residuals, test_residuals],
-                      positions=[1, 2],
-                      widths=0.6,
-                      patch_artist=True,
-                      tick_labels=['Train', 'Test'])
+                     positions=[1, 2],
+                     widths=0.6,
+                     patch_artist=True,
+                     tick_labels=['Train', 'Test'])
+    
     bp['boxes'][0].set_facecolor('lightblue')
     bp['boxes'][1].set_facecolor('orange')
     ax4.axhline(0, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
     ax4.set_ylabel('Residuals', fontsize=12, fontweight='bold')
-    ax4.set_title('Prediction Residuals', fontsize=13, fontweight='bold')
+    ax4.set_title(f'Prediction Residuals ({model_name})', fontsize=13, fontweight='bold')
     ax4.grid(True, alpha=0.3, axis='y')
     
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-
 
 # ============================================================================
 # 8. MAIN PIPELINE
@@ -1629,12 +1788,12 @@ def run_pipeline(
     use_images: bool = False,
     use_alpha_vantage: bool = False,
     n_trials: int = 100,
-    n_passes: int = 3,
+    n_passes: int = 4,
     max_leakage_retries: int = 3,
     use_pruning: bool = False
 ):
     """
-    Execute short interest prediction pipeline.
+    Execute short interest prediction pipeline with DUAL MODELS (XGBoost + Ridge).
     
     Args:
         stock_list: List of stock symbols for features
@@ -1645,9 +1804,11 @@ def run_pipeline(
         n_trials: Optuna optimization trials
         n_passes: Number of LLM feature generation passes
         max_leakage_retries: Retry attempts if leakage detected
+        use_pruning: Enable feature pruning
     """
     print("=" * 60)
-    print(f"SHORT INTEREST PREDICTION PIPELINE")
+    print(f"SHORT INTEREST PREDICTION PIPELINE - DUAL MODEL")
+    print(f"Models: XGBoost + Ridge Regression")
     print(f"LLM: {'Enabled' if use_llm else 'Disabled'}")
     print(f"Mode: {'Image' if use_images else 'Text'}")
     print(f"Passes: {n_passes}")
@@ -1662,6 +1823,7 @@ def run_pipeline(
     # 2. Load daily data
     print(f"\n2. Loading daily stock data...")
     stock_dict = {}
+    
     for stock in tqdm(stock_list, desc="  Processing"):
         try:
             stock_dict[stock] = get_stock_data(stock, use_alpha_vantage=use_alpha_vantage)
@@ -1746,7 +1908,7 @@ def run_pipeline(
         data['si_lag1'] = data['short_interest'].shift(1)
         data['si_lag2'] = data['short_interest'].shift(2)
         data['si_logdiff_lag1'] = (
-            np.log1p(data['short_interest'].shift(1)) - 
+            np.log1p(data['short_interest'].shift(1)) -
             np.log1p(data['short_interest'].shift(2))
         )
         
@@ -1757,63 +1919,78 @@ def run_pipeline(
         y_train = train_data['short_interest']
         X_test = test_data.drop(columns=['short_interest'])
         y_test = test_data['short_interest']
+        
         cutoff_date = train_data.index[-1]
         
-        # 7. Train model
-        print(f"\n5.{p} Training model for pass {p}...")
-        model, best_params, kept_cols, medians = train_xgboost_with_optuna(
+        # ========== TRAIN BOTH MODELS ==========
+        
+        # 7a. Train XGBoost
+        print(f"\n5.{p}a Training XGBoost model for pass {p}...")
+        xgb_model, xgb_params, xgb_cols, xgb_medians = train_xgboost_with_optuna(
             X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
         )
         
-        # 8. Evaluate
-        print(f"\n6.{p} Evaluating model for pass {p}...")
-        metrics = evaluate_model(model, X_train, y_train, X_test, y_test, kept_cols, medians)
+        # 7b. Train Ridge
+        print(f"\n5.{p}b Training Ridge model for pass {p}...")
+        ridge_model, ridge_params, ridge_cols, ridge_medians = train_ridge_with_optuna(
+            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
+        )
         
-        # 9. Feedback for next pass
+        # 8a. Evaluate XGBoost
+        print(f"\n6.{p}a Evaluating XGBoost model for pass {p}...")
+        xgb_metrics = evaluate_xgboost(xgb_model, X_train, y_train, X_test, y_test, xgb_cols, xgb_medians)
+        
+        # 8b. Evaluate Ridge
+        print(f"\n6.{p}b Evaluating Ridge model for pass {p}...")
+        ridge_metrics = evaluate_ridge(ridge_model, X_train, y_train, X_test, y_test, ridge_cols, ridge_medians)
+        
+        # 9. Feedback for next pass (use XGBoost for feature importance)
         if p < n_passes:
             print(f"\n7.{p} Computing feedback for pass {p+1}...")
             try:
                 gain_df, perm_df = compute_feature_importances(
-                    model, X_train[kept_cols], y_train, kept_cols
+                    xgb_model, X_train[xgb_cols], y_train, xgb_cols
                 )
+                
                 feedback_md, must_keep, avoid = summarize_feedback_for_llm(
                     gain_df, perm_df, X_train
                 )
+                
                 last_error = ""
             except Exception as e:
                 last_error = str(e)
                 feedback_md, must_keep, avoid = "", None, None
         
-        # 10. Plot
-        # val_size = max(3, int(0.2 * len(X_train)))
-        # y_train_plot = y_train.iloc[:-val_size]
-        # y_train_pred_plot = metrics["train_pred"][:-val_size] if len(metrics["train_pred"]) > val_size else metrics["train_pred"]
+        # 10. Plot both models
+        print(f"\n8.{p} Saving prediction visualizations for pass {p}...")
         
-        # plot_predictions(
-        #     y_train_plot,
-        #     y_train_pred_plot,
-        #     y_test,
-        #     metrics["test_pred"],
-        #     cutoff_date,
-        #     short_stock,
-        #     metrics,
-        #     save_path=f"{OUTPUT_DIR}/{short_stock}_predictions_pass{p}.png"
-        # )
+        # Plot XGBoost
         plot_predictions(
-            y_train, metrics['train_pred'],
-            y_test, metrics['test_pred'],
-            cutoff_date, short_stock, metrics,
-            save_path=f"{OUTPUT_DIR}/{short_stock}_predictions_pass{p}.png"
+            y_train, xgb_metrics['train_pred'],
+            y_test, xgb_metrics['test_pred'],
+            cutoff_date, short_stock, xgb_metrics,
+            model_name="XGBoost",
+            save_path=f"{OUTPUT_DIR}/{short_stock}_xgboost_predictions_pass{p}.png"
         )
         
+        # Plot Ridge
+        plot_predictions(
+            y_train, ridge_metrics['train_pred'],
+            y_test, ridge_metrics['test_pred'],
+            cutoff_date, short_stock, ridge_metrics,
+            model_name="Ridge",
+            save_path=f"{OUTPUT_DIR}/{short_stock}_ridge_predictions_pass{p}.png"
+        )
+    
     # Cleanup
     if use_images:
         clear_generated_artifacts(stock_list, short_stock)
     
     print("\n" + "="*60)
-    print("PIPELINE COMPLETE")
+    print("PIPELINE COMPLETE - BOTH MODELS TRAINED")
     print("="*60)
-
+    print(f"XGBoost predictions saved to: {OUTPUT_DIR}/{short_stock}_xgboost_predictions_pass*.png")
+    print(f"Ridge predictions saved to: {OUTPUT_DIR}/{short_stock}_ridge_predictions_pass*.png")
 
 # ============================================================================
 # 9. COMMAND-LINE INTERFACE
@@ -1821,37 +1998,37 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Stock Short Interest Prediction Pipeline',
+        description='Stock Short Interest Prediction Pipeline - Dual Model (XGBoost + Ridge)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python full_pipeline.py --use-llm
   python full_pipeline.py --use-llm --use-images
   python full_pipeline.py --use-llm --use-alpha-vantage --n-trials 20
-        """
+"""
     )
-    parser.add_argument('--use-llm', action='store_true', 
-                       help='Enable LLM feature generation (required)')
+    
+    parser.add_argument('--use-llm', action='store_true',
+                        help='Enable LLM feature generation (required)')
     parser.add_argument('--use-images', action='store_true',
-                       help='Send visualizations to LLM (uses more tokens)')
+                        help='Send visualizations to LLM (uses more tokens)')
     parser.add_argument('--use-alpha-vantage', action='store_true',
-                       help='Use Alpha Vantage API instead of Bloomberg file')
+                        help='Use Alpha Vantage API instead of Bloomberg file')
     parser.add_argument('--n-trials', type=int, default=100,
-                       help='Optuna optimization trials (default: 100)')
+                        help='Optuna optimization trials (default: 100)')
     parser.add_argument('--n-passes', type=int, default=3,
-                       help='Number of LLM feature generation passes (default: 3)')
+                        help='Number of LLM feature generation passes (default: 3)')
     parser.add_argument('--use-pruning', action='store_true',
                         help='Enable feature pruning before training (default: disabled)')
-
     
     args = parser.parse_args()
     
-    # User input
-# User input for market index
+    # User input for market index
     print("Available market indices: SPX (S&P 500), RUI (Russell 1000), RUA (Russell 3000)")
     market_index = input("Enter market index to use (default: SPX): ").strip().upper()
     if not market_index:
         market_index = "SPX"
+    
     if market_index not in ["SPX", "RUI", "RUA"]:
         print(f"Warning: {market_index} not recognized. Using SPX as default.")
         market_index = "SPX"
