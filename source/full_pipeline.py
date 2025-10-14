@@ -590,6 +590,7 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
 def _build_claude_payload(
     daily_df: pd.DataFrame,
     short_stock: str,
+    target_description: str = "raw short interest",  # NEW PARAMETER
     max_number_of_features: int = 15,
     last_error: str = "",
     feedback_md: str = "",
@@ -598,6 +599,7 @@ def _build_claude_payload(
     use_images: bool = False,
     image_dict: Optional[Dict] = None,
 ) -> dict:
+
     """
     Build Claude API payload for feature generation.
     
@@ -616,7 +618,10 @@ def _build_claude_payload(
         Dict ready for Claude API
     """
     # Optimized system prompt - CRITICAL: enforce "feature_" prefix
-    system_constraints = f"""Generate {max_number_of_features} leakage-safe DAILY features for {short_stock} short interest prediction.
+    # Modified system prompt with target-specific context
+    system_constraints = f"""Generate {max_number_of_features} leakage-safe DAILY features for {short_stock}.
+
+TARGET PREDICTION: {target_description}
 
 {{
   "output_format": {{
@@ -645,6 +650,7 @@ def feature_price_momentum_5d(df):
     return (close / close.rolling(5, min_periods=1).mean() - 1).fillna(0)
 
 Emit ONLY fenced Python code. No explanations."""
+
     
     # Build user content with condensed structure
     parts = []
@@ -830,6 +836,7 @@ def generate_llm_features(
     short_df: pd.DataFrame,
     stock_list: List[str],
     short_stock: str,
+    target_description: str = "raw short interest",  # NEW PARAMETER
     max_features: int = 8,
     last_error: str = "",
     feedback_md: str = "",
@@ -838,25 +845,7 @@ def generate_llm_features(
     out_file: str = "generated_features.py",
     use_images: bool = False,
 ) -> Tuple[bool, str]:
-    """
-    Generate feature module using Claude API.
     
-    Args:
-        daily_df: Master daily DataFrame
-        short_df: Short interest DataFrame
-        stock_list: List of stock symbols
-        short_stock: Target stock symbol
-        max_features: Maximum features to generate
-        last_error: Error from previous attempt
-        feedback_md: Feedback from previous pass
-        must_keep: Features to preserve
-        avoid: Features to avoid
-        out_file: Path to save generated code
-        use_images: Whether to use image mode
-    
-    Returns:
-        (success, error_message)
-    """
     # Build image dict if needed
     image_dict = None
     if use_images:
@@ -865,6 +854,7 @@ def generate_llm_features(
     payload = _build_claude_payload(
         daily_df=daily_df,
         short_stock=short_stock,
+        target_description=target_description,  # PASS IT HERE
         max_number_of_features=max_features,
         last_error=last_error or "",
         feedback_md=feedback_md or "",
@@ -875,8 +865,8 @@ def generate_llm_features(
     )
     
     code, err = call_claude_and_write_features(payload, out_file)
-    
     return (code is not None), (err or "")
+
 
 # ============================================================================
 # 5. FEATURE VALIDATION & EXECUTION
@@ -1778,8 +1768,368 @@ def plot_predictions(y_train: pd.Series,
     plt.close()
 
 # ============================================================================
+# TARGET TRANSFORMATION FUNCTIONS
+# ============================================================================
+
+def create_target_variants(short_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    Create three variants of the target variable.
+    
+    Returns:
+        Dict with keys: 'raw', 'pct_change', 'log_change'
+    """
+    variants = {}
+    
+    # 1. Raw short interest (original)
+    variants['raw'] = short_df.copy()
+    variants['raw']['target'] = variants['raw']['short_interest']
+    
+    # 2. Percentage change: (SI_t - SI_t-1) / SI_t-1
+    si = short_df['short_interest']
+    pct_change = (si - si.shift(1)) / si.shift(1)
+    variants['pct_change'] = pd.DataFrame({
+        'short_interest': si,
+        'target': pct_change
+    }, index=short_df.index)
+    
+    # 3. Log transformation: log(SI_t / SI_t-1)
+    log_change = np.log(si / si.shift(1))
+    variants['log_change'] = pd.DataFrame({
+        'short_interest': si,
+        'target': log_change
+    }, index=short_df.index)
+    
+    return variants
+
+
+def plot_comparative_results(
+    results: Dict[str, Dict],
+    short_stock: str,
+    cutoff_dates: Dict[str, pd.Timestamp],
+    save_dir: str = "outputs"
+):
+    """
+    Create comparative visualization across all three target transformations.
+    
+    Args:
+        results: {target_type: {model_type: {metrics, predictions, y_train, y_test}}}
+        short_stock: Stock symbol
+        cutoff_dates: Train/test split dates for each target
+        save_dir: Output directory
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    
+    fig = plt.figure(figsize=(20, 14))
+    gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
+    
+    target_types = ['raw', 'pct_change', 'log_change']
+    target_labels = ['Raw Short Interest', 'Percentage Change', 'Log Change']
+    
+    # Rows 1-2: Time series plots for each target
+    for col_idx, (target_type, target_label) in enumerate(zip(target_types, target_labels)):
+        if target_type not in results:
+            continue
+        
+        # XGBoost subplot
+        ax_xgb = fig.add_subplot(gs[0, col_idx])
+        xgb_data = results[target_type]['xgb']
+        y_train = xgb_data['y_train']
+        y_test = xgb_data['y_test']
+        train_pred = xgb_data['metrics']['train_pred']
+        test_pred = xgb_data['metrics']['test_pred']
+        
+        ax_xgb.plot(y_train.index, y_train.values, 'o-', color='blue', alpha=0.6,
+                   label='Actual (Train)', markersize=4, linewidth=1.5)
+        ax_xgb.plot(y_train.index, train_pred, 's--', color='lightblue', alpha=0.8,
+                   label='Pred (Train)', markersize=3, linewidth=1)
+        ax_xgb.plot(y_test.index, y_test.values, 'o-', color='red', alpha=0.8,
+                   label='Actual (Test)', markersize=5, linewidth=1.5)
+        ax_xgb.plot(y_test.index, test_pred, 's--', color='orange', alpha=0.9,
+                   label='Pred (Test)', markersize=4, linewidth=1.5)
+        ax_xgb.axvline(cutoff_dates[target_type], color='green', linestyle='--', linewidth=2, alpha=0.7)
+        ax_xgb.set_title(f'{target_label}\\nXGBoost - R²: {xgb_data["metrics"]["test_r2"]:.4f}',
+                        fontsize=11, fontweight='bold')
+        ax_xgb.legend(fontsize=8)
+        ax_xgb.grid(True, alpha=0.3)
+        
+        # Ridge subplot
+        ax_ridge = fig.add_subplot(gs[1, col_idx])
+        ridge_data = results[target_type]['ridge']
+        y_train = ridge_data['y_train']
+        y_test = ridge_data['y_test']
+        train_pred = ridge_data['metrics']['train_pred']
+        test_pred = ridge_data['metrics']['test_pred']
+        
+        ax_ridge.plot(y_train.index, y_train.values, 'o-', color='blue', alpha=0.6,
+                     label='Actual (Train)', markersize=4, linewidth=1.5)
+        ax_ridge.plot(y_train.index, train_pred, 's--', color='lightblue', alpha=0.8,
+                     label='Pred (Train)', markersize=3, linewidth=1)
+        ax_ridge.plot(y_test.index, y_test.values, 'o-', color='red', alpha=0.8,
+                     label='Actual (Test)', markersize=5, linewidth=1.5)
+        ax_ridge.plot(y_test.index, test_pred, 's--', color='orange', alpha=0.9,
+                     label='Pred (Test)', markersize=4, linewidth=1.5)
+        ax_ridge.axvline(cutoff_dates[target_type], color='green', linestyle='--', linewidth=2, alpha=0.7)
+        ax_ridge.set_title(f'Ridge - R²: {ridge_data["metrics"]["test_r2"]:.4f}',
+                          fontsize=11, fontweight='bold')
+        ax_ridge.legend(fontsize=8)
+        ax_ridge.grid(True, alpha=0.3)
+    
+    # Row 3: Out-of-sample R² comparison
+    ax_r2 = fig.add_subplot(gs[2, :])
+    r2_data = {'Target': [], 'XGBoost': [], 'Ridge': []}
+    
+    for target_type, target_label in zip(target_types, target_labels):
+        if target_type in results:
+            r2_data['Target'].append(target_label)
+            r2_data['XGBoost'].append(results[target_type]['xgb']['metrics']['test_r2'])
+            r2_data['Ridge'].append(results[target_type]['ridge']['metrics']['test_r2'])
+    
+    x = np.arange(len(r2_data['Target']))
+    width = 0.35
+    bars1 = ax_r2.bar(x - width/2, r2_data['XGBoost'], width, label='XGBoost',
+                      color='steelblue', alpha=0.8)
+    bars2 = ax_r2.bar(x + width/2, r2_data['Ridge'], width, label='Ridge',
+                      color='coral', alpha=0.8)
+    
+    ax_r2.set_ylabel('Out-of-Sample R²', fontsize=12, fontweight='bold')
+    ax_r2.set_title('Model Performance Comparison', fontsize=13, fontweight='bold')
+    ax_r2.set_xticks(x)
+    ax_r2.set_xticklabels(r2_data['Target'])
+    ax_r2.legend()
+    ax_r2.grid(True, alpha=0.3, axis='y')
+    ax_r2.axhline(y=0, color='black', linestyle='-', linewidth=0.8)
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax_r2.text(bar.get_x() + bar.get_width()/2., height,
+                      f'{height:.3f}', ha='center', va='bottom' if height >= 0 else 'top',
+                      fontsize=9, fontweight='bold')
+    
+    # Row 4: RMSE comparison
+    ax_rmse = fig.add_subplot(gs[3, :])
+    rmse_data = {'Target': [], 'XGBoost': [], 'Ridge': []}
+    
+    for target_type, target_label in zip(target_types, target_labels):
+        if target_type in results:
+            rmse_data['Target'].append(target_label)
+            rmse_data['XGBoost'].append(results[target_type]['xgb']['metrics']['test_rmse'])
+            rmse_data['Ridge'].append(results[target_type]['ridge']['metrics']['test_rmse'])
+    
+    bars1 = ax_rmse.bar(x - width/2, rmse_data['XGBoost'], width, label='XGBoost',
+                        color='steelblue', alpha=0.8)
+    bars2 = ax_rmse.bar(x + width/2, rmse_data['Ridge'], width, label='Ridge',
+                        color='coral', alpha=0.8)
+    
+    ax_rmse.set_ylabel('Out-of-Sample RMSE', fontsize=12, fontweight='bold')
+    ax_rmse.set_title('Prediction Error Comparison', fontsize=13, fontweight='bold')
+    ax_rmse.set_xticks(x)
+    ax_rmse.set_xticklabels(rmse_data['Target'])
+    ax_rmse.legend()
+    ax_rmse.grid(True, alpha=0.3, axis='y')
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax_rmse.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:.4f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    plt.suptitle(f'{short_stock} - Multi-Target Comparison', fontsize=16, fontweight='bold')
+    save_path = os.path.join(save_dir, f'{short_stock}_multi_target_comparison.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"\n ✓ Comparative plot saved to: {save_path}")
+
+
+# ============================================================================
 # 8. MAIN PIPELINE
 # ============================================================================
+
+def run_pipeline_for_target(
+    target_type: str,
+    target_label: str,
+    daily_master: pd.DataFrame,
+    short_df_variant: pd.DataFrame,
+    stock_list: List[str],
+    short_stock: str,
+    use_llm: bool,
+    use_images: bool,
+    n_trials: int,
+    n_passes: int,
+    max_leakage_retries: int,
+    use_pruning: bool
+) -> Dict:
+    """
+    Run pipeline for a single target transformation.
+    
+    Returns:
+        Dict with XGBoost and Ridge results
+    """
+    print("\n" + "="*70)
+    print(f"PROCESSING TARGET: {target_label}")
+    print("="*70)
+    
+    target_idx = short_df_variant.index
+    
+    # Create target-specific output directory
+    target_output_dir = os.path.join(OUTPUT_DIR, f"target_{target_type}")
+    os.makedirs(target_output_dir, exist_ok=True)
+    
+    # Generate target-specific features
+    feature_files = []
+    last_error = ""
+    feedback_md = ""
+    must_keep = None
+    avoid = None
+    
+    # Define target-specific descriptions for the LLM
+    target_descriptions = {
+        'raw': f"raw biweekly short interest values for {short_stock}",
+        'pct_change': f"percentage change in short interest from previous period for {short_stock}: (SI_t - SI_t-1) / SI_t-1",
+        'log_change': f"log-transformed change in short interest for {short_stock}: log(SI_t / SI_t-1)"
+    }
+    
+    target_description = target_descriptions[target_type]
+
+    for p in range(1, n_passes + 1):
+        out_file = os.path.join("generated", f"{short_stock}_{target_type}_pass{p}.py")
+        
+        for attempt in range(1, max_leakage_retries + 1):
+            print(f"\n Generating {target_label} features (pass {p}, attempt {attempt})...")
+            
+            # Modify the system prompt to include target type context
+            ok, err = generate_llm_features(
+                daily_df=daily_master,
+                short_df=short_df_variant,
+                stock_list=stock_list,
+                short_stock=short_stock,
+                target_description=target_description,  # TARGET-SPECIFIC DESCRIPTION
+                max_features=8,
+                last_error=last_error,
+                feedback_md=feedback_md,
+                must_keep=must_keep,
+                avoid=avoid,
+                out_file=out_file,
+                use_images=use_images,
+            )
+            
+            if ok and os.path.exists(out_file):
+                break
+            if err.startswith("validation_error:"):
+                last_error = f"PREVIOUS ERROR: {err.replace('validation_error:', '')}. Fix this."
+                continue
+            else:
+                break
+        
+        if not (ok and os.path.exists(out_file)):
+            raise RuntimeError(f"Feature generation failed for {target_label} at pass {p}")
+        
+        feature_files.append(out_file)
+        
+        # Build features
+        print(f"\n Building feature set for {target_label} pass {p}...")
+        features_df = create_full_feature_set(
+            daily_df=daily_master,
+            target_dates=target_idx,
+            lag_days=DEFAULT_LAG_DAYS,
+            feature_files=feature_files,
+        )
+        
+        if features_df.empty:
+            raise RuntimeError(f"Empty feature matrix for {target_label} pass {p}")
+        
+        # Prepare data with the transformed target
+        cut_idx = max(int(len(target_idx) * (1 - TEST_SIZE)), 1)
+        data = features_df.join(short_df_variant[['short_interest', 'target']], how='inner').sort_index()
+        
+        # Add safe lag features based on the ORIGINAL short interest
+        data['si_lag1'] = data['short_interest'].shift(1)
+        data['si_lag2'] = data['short_interest'].shift(2)
+        data['si_logdiff_lag1'] = (
+            np.log1p(data['short_interest'].shift(1)) -
+            np.log1p(data['short_interest'].shift(2))
+        )
+        
+        # Drop rows with NaN in target (from transformations)
+        data = data.dropna(subset=['target'])
+        
+        train_data = data.iloc[:cut_idx]
+        test_data = data.iloc[cut_idx:]
+        
+        X_train = train_data.drop(columns=['short_interest', 'target'])
+        y_train = train_data['target']
+        X_test = test_data.drop(columns=['short_interest', 'target'])
+        y_test = test_data['target']
+        cutoff_date = train_data.index[-1]
+        
+        # Train XGBoost
+        print(f"\n Training XGBoost for {target_label} pass {p}...")
+        xgb_model, xgb_params, xgb_cols, xgb_medians = train_xgboost_with_optuna(
+            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
+        )
+        
+        # Train Ridge
+        print(f"\n Training Ridge for {target_label} pass {p}...")
+        ridge_model, ridge_params, ridge_cols, ridge_medians = train_ridge_with_optuna(
+            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
+        )
+        
+        # Evaluate both models
+        print(f"\n Evaluating XGBoost for {target_label} pass {p}...")
+        xgb_metrics = evaluate_xgboost(xgb_model, X_train, y_train, X_test, y_test, xgb_cols, xgb_medians)
+        
+        print(f"\n Evaluating Ridge for {target_label} pass {p}...")
+        ridge_metrics = evaluate_ridge(ridge_model, X_train, y_train, X_test, y_test, ridge_cols, ridge_medians)
+        
+        # Generate feedback for next pass
+        if p < n_passes:
+            print(f"\n Computing feedback for {target_label} pass {p+1}...")
+            try:
+                gain_df, perm_df = compute_feature_importances(
+                    xgb_model, X_train[xgb_cols], y_train, xgb_cols
+                )
+                feedback_md, must_keep, avoid = summarize_feedback_for_llm(
+                    gain_df, perm_df, X_train
+                )
+                last_error = ""
+            except Exception as e:
+                last_error = str(e)
+                feedback_md, must_keep, avoid = "", None, None
+        
+        # Plot individual target results
+        plot_predictions(
+            y_train, xgb_metrics['train_pred'],
+            y_test, xgb_metrics['test_pred'],
+            cutoff_date, short_stock, xgb_metrics,
+            model_name=f"XGBoost-{target_label}",
+            save_path=f"{target_output_dir}/{short_stock}_xgb_{target_type}_pass{p}.png"
+        )
+        
+        plot_predictions(
+            y_train, ridge_metrics['train_pred'],
+            y_test, ridge_metrics['test_pred'],
+            cutoff_date, short_stock, ridge_metrics,
+            model_name=f"Ridge-{target_label}",
+            save_path=f"{target_output_dir}/{short_stock}_ridge_{target_type}_pass{p}.png"
+        )
+    
+    # Return final results
+    return {
+        'xgb': {
+            'metrics': xgb_metrics,
+            'y_train': y_train,
+            'y_test': y_test,
+            'cutoff_date': cutoff_date
+        },
+        'ridge': {
+            'metrics': ridge_metrics,
+            'y_train': y_train,
+            'y_test': y_test,
+            'cutoff_date': cutoff_date
+        }
+    }
+
 
 def run_pipeline(
     stock_list: List[str],
@@ -1793,204 +2143,98 @@ def run_pipeline(
     use_pruning: bool = False
 ):
     """
-    Execute short interest prediction pipeline with DUAL MODELS (XGBoost + Ridge).
+    Execute multi-target short interest prediction pipeline.
     
-    Args:
-        stock_list: List of stock symbols for features
-        short_stock: Target stock to predict short interest
-        use_llm: Enable LLM feature generation
-        use_images: Send visualizations to LLM
-        use_alpha_vantage: Use Alpha Vantage instead of Bloomberg
-        n_trials: Optuna optimization trials
-        n_passes: Number of LLM feature generation passes
-        max_leakage_retries: Retry attempts if leakage detected
-        use_pruning: Enable feature pruning
+    Runs pipeline for three target transformations:
+    1. Raw short interest
+    2. Percentage change
+    3. Log transformation
     """
-    print("=" * 60)
-    print(f"SHORT INTEREST PREDICTION PIPELINE - DUAL MODEL")
-    print(f"Models: XGBoost + Ridge Regression")
-    print(f"LLM: {'Enabled' if use_llm else 'Disabled'}")
-    print(f"Mode: {'Image' if use_images else 'Text'}")
-    print(f"Passes: {n_passes}")
-    print("=" * 60)
+    print("="*70)
+    print("MULTI-TARGET SHORT INTEREST PREDICTION PIPELINE")
+    print("Models: XGBoost + Ridge | Targets: Raw, Pct Change, Log Change")
+    print("="*70)
     
     # 1. Load target data
     print(f"\n1. Loading short interest data for {short_stock}...")
     short_df = get_finra_short_data(short_stock)
-    target_idx = short_df.index
-    print(f"  ✓ Found {len(short_df)} biweekly measurements")
+    print(f" ✓ Found {len(short_df)} biweekly measurements")
     
     # 2. Load daily data
     print(f"\n2. Loading daily stock data...")
     stock_dict = {}
-    
-    for stock in tqdm(stock_list, desc="  Processing"):
+    for stock in tqdm(stock_list, desc=" Processing"):
         try:
             stock_dict[stock] = get_stock_data(stock, use_alpha_vantage=use_alpha_vantage)
         except Exception as e:
-            print(f"  ⚠ Skipping {stock}: {e}")
+            print(f" ⚠ Skipping {stock}: {e}")
     
     if not stock_dict:
         raise RuntimeError("No stock data loaded")
     
-    # Build master DataFrame
     daily_master = create_daily_master_df(stock_dict=stock_dict)
-    print(f"  ✓ Master DataFrame: {daily_master.shape}")
+    print(f" ✓ Master DataFrame: {daily_master.shape}")
     
     # 3. Generate visualizations if image mode
     if use_llm and use_images:
         visualize_data_for_llm(daily_master, stock_list, short_stock)
     
-    # 4. LLM feature generation (multi-pass)
-    if not use_llm:
-        raise RuntimeError("This pipeline requires LLM mode (--use-llm)")
+    # 4. Create target variants
+    print(f"\n3. Creating target variants...")
+    target_variants = create_target_variants(short_df)
+    target_labels = {
+        'raw': 'Raw Short Interest',
+        'pct_change': 'Percentage Change',
+        'log_change': 'Log Change'
+    }
     
-    os.makedirs("generated", exist_ok=True)
-    feature_files = []
-    last_error = ""
-    feedback_md = ""
-    must_keep = None
-    avoid = None
+    # 5. Run pipeline for each target
+    all_results = {}
+    cutoff_dates = {}
     
-    for p in range(1, n_passes + 1):
-        out_file = os.path.join("generated", f"{short_stock}_features_pass{p}.py")
+    for target_type in ['raw', 'pct_change', 'log_change']:
+        target_label = target_labels[target_type]
         
-        # Retry logic for leakage detection
-        for attempt in range(1, max_leakage_retries + 1):
-            print(f"\n3.{p}.{attempt} Generating LLM features (pass {p}, attempt {attempt})...")
-            
-            ok, err = generate_llm_features(
-                daily_df=daily_master,
-                short_df=short_df,
+        try:
+            results = run_pipeline_for_target(
+                target_type=target_type,
+                target_label=target_label,
+                daily_master=daily_master,
+                short_df_variant=target_variants[target_type],
                 stock_list=stock_list,
                 short_stock=short_stock,
-                max_features=8,
-                last_error=last_error,
-                feedback_md=feedback_md,
-                must_keep=must_keep,
-                avoid=avoid,
-                out_file=out_file,
+                use_llm=use_llm,
                 use_images=use_images,
+                n_trials=n_trials,
+                n_passes=n_passes,
+                max_leakage_retries=max_leakage_retries,
+                use_pruning=use_pruning
             )
             
-            if ok and os.path.exists(out_file):
-                break
+            all_results[target_type] = results
+            cutoff_dates[target_type] = results['xgb']['cutoff_date']
             
-            if err.startswith("validation_error:"):
-                print(f"  ⚠ Validation failed: {err}")
-                last_error = f"PREVIOUS ERROR: {err.replace('validation_error:', '')}. Fix this issue."
-                continue
-            else:
-                break
-        
-        if not (ok and os.path.exists(out_file)):
-            raise RuntimeError(f"Feature generation failed at pass {p} after {max_leakage_retries} attempts")
-        
-        feature_files.append(out_file)
-        
-        # 5. Build features
-        print(f"\n4.{p} Building feature set for pass {p}...")
-        features_df = create_full_feature_set(
-            daily_df=daily_master,
-            target_dates=target_idx,
-            lag_days=DEFAULT_LAG_DAYS,
-            feature_files=feature_files,
-        )
-        
-        if features_df.empty:
-            raise RuntimeError(f"Empty feature matrix at pass {p}. Check that LLM generated valid 'feature_*' functions.")
-        
-        # 6. Train/test split
-        cut_idx = max(int(len(target_idx) * (1 - TEST_SIZE)), 1)
-        data = features_df.join(short_df['short_interest'], how='inner').sort_index()
-        
-        # Add safe lag features
-        data['si_lag1'] = data['short_interest'].shift(1)
-        data['si_lag2'] = data['short_interest'].shift(2)
-        data['si_logdiff_lag1'] = (
-            np.log1p(data['short_interest'].shift(1)) -
-            np.log1p(data['short_interest'].shift(2))
-        )
-        
-        train_data = data.iloc[:cut_idx]
-        test_data = data.iloc[cut_idx:]
-        
-        X_train = train_data.drop(columns=['short_interest'])
-        y_train = train_data['short_interest']
-        X_test = test_data.drop(columns=['short_interest'])
-        y_test = test_data['short_interest']
-        
-        cutoff_date = train_data.index[-1]
-        
-        # ========== TRAIN BOTH MODELS ==========
-        
-        # 7a. Train XGBoost
-        print(f"\n5.{p}a Training XGBoost model for pass {p}...")
-        xgb_model, xgb_params, xgb_cols, xgb_medians = train_xgboost_with_optuna(
-            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
-        )
-        
-        # 7b. Train Ridge
-        print(f"\n5.{p}b Training Ridge model for pass {p}...")
-        ridge_model, ridge_params, ridge_cols, ridge_medians = train_ridge_with_optuna(
-            X_train, y_train, n_trials=n_trials, use_pruning=use_pruning
-        )
-        
-        # 8a. Evaluate XGBoost
-        print(f"\n6.{p}a Evaluating XGBoost model for pass {p}...")
-        xgb_metrics = evaluate_xgboost(xgb_model, X_train, y_train, X_test, y_test, xgb_cols, xgb_medians)
-        
-        # 8b. Evaluate Ridge
-        print(f"\n6.{p}b Evaluating Ridge model for pass {p}...")
-        ridge_metrics = evaluate_ridge(ridge_model, X_train, y_train, X_test, y_test, ridge_cols, ridge_medians)
-        
-        # 9. Feedback for next pass (use XGBoost for feature importance)
-        if p < n_passes:
-            print(f"\n7.{p} Computing feedback for pass {p+1}...")
-            try:
-                gain_df, perm_df = compute_feature_importances(
-                    xgb_model, X_train[xgb_cols], y_train, xgb_cols
-                )
-                
-                feedback_md, must_keep, avoid = summarize_feedback_for_llm(
-                    gain_df, perm_df, X_train
-                )
-                
-                last_error = ""
-            except Exception as e:
-                last_error = str(e)
-                feedback_md, must_keep, avoid = "", None, None
-        
-        # 10. Plot both models
-        print(f"\n8.{p} Saving prediction visualizations for pass {p}...")
-        
-        # Plot XGBoost
-        plot_predictions(
-            y_train, xgb_metrics['train_pred'],
-            y_test, xgb_metrics['test_pred'],
-            cutoff_date, short_stock, xgb_metrics,
-            model_name="XGBoost",
-            save_path=f"{OUTPUT_DIR}/{short_stock}_xgboost_predictions_pass{p}.png"
-        )
-        
-        # Plot Ridge
-        plot_predictions(
-            y_train, ridge_metrics['train_pred'],
-            y_test, ridge_metrics['test_pred'],
-            cutoff_date, short_stock, ridge_metrics,
-            model_name="Ridge",
-            save_path=f"{OUTPUT_DIR}/{short_stock}_ridge_predictions_pass{p}.png"
-        )
+        except Exception as e:
+            print(f"\n ⚠ ERROR processing {target_label}: {e}")
+            continue
+    
+    # 6. Create comparative plots
+    print("\n" + "="*70)
+    print("CREATING COMPARATIVE VISUALIZATIONS")
+    print("="*70)
+    
+    if all_results:
+        plot_comparative_results(all_results, short_stock, cutoff_dates, OUTPUT_DIR)
     
     # Cleanup
     if use_images:
         clear_generated_artifacts(stock_list, short_stock)
     
-    print("\n" + "="*60)
-    print("PIPELINE COMPLETE - BOTH MODELS TRAINED")
-    print("="*60)
-    print(f"XGBoost predictions saved to: {OUTPUT_DIR}/{short_stock}_xgboost_predictions_pass*.png")
-    print(f"Ridge predictions saved to: {OUTPUT_DIR}/{short_stock}_ridge_predictions_pass*.png")
+    print("\n" + "="*70)
+    print("MULTI-TARGET PIPELINE COMPLETE")
+    print("="*70)
+    print(f"Results saved to: {OUTPUT_DIR}/")
+    print(f"Comparative plot: {OUTPUT_DIR}/{short_stock}_multi_target_comparison.png")
 
 # ============================================================================
 # 9. COMMAND-LINE INTERFACE
