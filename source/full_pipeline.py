@@ -79,6 +79,7 @@ FILE_PATH_BBG = os.path.join(SCRIPT_DIR, '..', 'data', 'BloombergJPM_noformula.x
 IN_IMAGES_DIR = "in_images"
 IN_TABULAR_DIR = "in_tabular"
 OUTPUT_DIR = "outputs"
+NOLBERT_FILE_PATH = os.path.join(SCRIPT_DIR, '..', 'NoLBERT', 'merged_with_nolbert_union.xlsx')
 
 # Create directories
 os.makedirs(IN_IMAGES_DIR, exist_ok=True)
@@ -358,33 +359,48 @@ def get_stock_data(ticker: str, file_path: str = FILE_PATH_BBG,
 # 2. DATA PREPROCESSING
 # ============================================================================
 
-def create_daily_master_df(stock_dict: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+def create_daily_master_df(stock_dict: Dict[str, pd.DataFrame], 
+                            nolbert_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
-    Combine all daily stock data into single master DataFrame.
-    
+    Combine all daily stock data and optionally NoLBERT NLP data into single master DataFrame.
+
     Args:
         stock_dict: Dict mapping stock symbols to their DataFrames
-    
+        nolbert_df: Optional NoLBERT sentiment DataFrame with columns nolbert_negative, nolbert_neutral, nolbert_positive
+
     Returns:
-        Master DataFrame with columns prefixed by stock symbol (e.g., AAPL_PX_LAST)
-    
+        Master DataFrame with columns prefixed by stock symbol (e.g., AAPL_PX_LAST) and NoLBERT sentiment features
+
     Note:
-        - Forward-fills missing values with 5-day limit to avoid stale data
+        - Forward-fills missing stock values with 5-day limit to avoid stale data
+        - Forward-fills NoLBERT sentiment with 60-day limit (earnings calls are quarterly)
         - All stocks aligned to union of dates
     """
     all_dates = pd.DatetimeIndex([])
     for df in stock_dict.values():
         all_dates = all_dates.union(df.index)
+
+    # Add NoLBERT dates if available
+    if nolbert_df is not None and not nolbert_df.empty:
+        all_dates = all_dates.union(nolbert_df.index)
+
     all_dates = all_dates.sort_values()
-    
     master_df = pd.DataFrame(index=all_dates)
-    
+
     # Add stock data with prefixes
     for stock, df in stock_dict.items():
         aligned = df.reindex(master_df.index).ffill(limit=5)  # 5-day stale limit
         aligned = aligned.add_prefix(f"{stock}_")
         master_df = master_df.join(aligned, how='left')
-    
+
+    # Add NoLBERT sentiment data if available
+    if nolbert_df is not None and not nolbert_df.empty:
+        # Forward fill sentiment data (earnings calls are infrequent - quarterly)
+        # Use a longer fill limit since earnings calls happen every ~3 months
+        aligned_nolbert = nolbert_df.reindex(master_df.index).ffill(limit=60)  # ~3 months = 60 trading days
+        master_df = master_df.join(aligned_nolbert, how='left')
+        print(f"   ✓ Added NoLBERT features to master DataFrame: {list(aligned_nolbert.columns)}")
+
     master_df = master_df.dropna(how='all', axis=1)
     return master_df
 
@@ -543,11 +559,11 @@ def clear_generated_artifacts(stock_list: List[str], short_stock: str) -> None:
 def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
     """
     Build compact JSON string with per-column metadata for LLM.
-    
+
     Args:
         daily_df: Master daily DataFrame
         max_cols: Maximum columns to include
-    
+
     Returns:
         JSON string with column statistics
     """
@@ -560,22 +576,24 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
         "notes": [
             "Columns prefixed by ticker (e.g., AAPL_PX_LAST)",
             "Daily frequency with possible gaps",
-            "Pipeline aligns features to biweekly targets with 14-day lag"
+            "Pipeline aligns features to biweekly targets with 14-day lag",
+            "NoLBERT sentiment features (nolbert_negative, nolbert_neutral, nolbert_positive) represent NLP sentiment analysis from earnings call transcripts",
+            "NoLBERT features are forward-filled for up to 60 days since earnings calls are quarterly events"
         ]
     }
-    
+
     for c in cols:
         s = daily_df[c]
         n = int(s.notna().sum())
         nan_ratio = float(s.isna().mean())
         dtype = str(s.dtype)
-        
+
         if n >= 30:
             p01 = float(s.quantile(0.01)) if n > 0 else None
             p50 = float(s.median()) if n > 0 else None
             p99 = float(s.quantile(0.99)) if n > 0 else None
             stdev_63 = float(s.rolling(63, min_periods=20).std().median()) if n > 0 else None
-            
+
             summary["columns"].append({
                 "name": c, "dtype": dtype, "n_non_nan": n, "nan_ratio": round(nan_ratio, 4),
                 "p01": p01, "p50": p50, "p99": p99, "stdev_63": stdev_63
@@ -584,7 +602,7 @@ def _summarize_dataset(daily_df: pd.DataFrame, max_cols: int = 200) -> str:
             summary["columns"].append({
                 "name": c, "dtype": dtype, "n_non_nan": n, "nan_ratio": round(nan_ratio, 4)
             })
-    
+
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
 def _build_claude_payload(
@@ -1943,6 +1961,67 @@ def plot_comparative_results(
 
 
 # ============================================================================
+# 8. NoLBERT
+# ============================================================================
+
+
+
+def load_nolbert_data(ticker: str, file_path: str = NOLBERT_FILE_PATH) -> pd.DataFrame:
+    """
+    Load NoLBERT NLP sentiment data for a specific ticker.
+
+    Args:
+        ticker: Stock symbol
+        file_path: Path to NoLBERT Excel file
+
+    Returns:
+        DataFrame with DateTimeIndex and sentiment columns: nolbert_negative, nolbert_neutral, nolbert_positive
+
+    Note:
+        - Filters data for the specified ticker
+        - Uses event_dt as the index
+        - Forward-fills sentiment across dates (earnings calls are infrequent)
+    """
+    try:
+        df = pd.read_excel(file_path)
+    except Exception as e:
+        print(f"   ⚠ Could not load NoLBERT data: {e}")
+        return pd.DataFrame()
+
+    # Filter for the specific ticker (case-insensitive)
+    df = df[df['ticker'].str.upper() == ticker.upper()].copy()
+
+    if df.empty:
+        print(f"   ⚠ No NoLBERT data found for {ticker}")
+        return pd.DataFrame()
+
+    # Convert event_dt to datetime and set as index
+    df['event_dt'] = pd.to_datetime(df['event_dt'], errors='coerce')
+    df = df.dropna(subset=['event_dt'])
+    df = df.set_index('event_dt').sort_index()
+
+    # Select only the sentiment columns we want
+    sentiment_cols = ['NEGATIVE', 'NEUTRAL', 'POSITIVE']
+    available_cols = [col for col in sentiment_cols if col in df.columns]
+
+    if not available_cols:
+        print(f"   ⚠ No sentiment columns (NEGATIVE, NEUTRAL, POSITIVE) found in NoLBERT data")
+        return pd.DataFrame()
+
+    nolbert_df = df[available_cols].copy()
+
+    # Convert to numeric (in case they're strings)
+    for col in nolbert_df.columns:
+        nolbert_df[col] = pd.to_numeric(nolbert_df[col], errors='coerce')
+
+    # Add prefix to column names to distinguish them in the master dataframe
+    nolbert_df.columns = [f'nolbert_{col.lower()}' for col in nolbert_df.columns]
+
+    print(f"   ✓ Loaded NoLBERT data: {len(nolbert_df)} records with columns {list(nolbert_df.columns)}")
+    print(f"   ✓ Date range: {nolbert_df.index.min()} to {nolbert_df.index.max()}")
+
+    return nolbert_df
+# ============================================================================
 # 8. MAIN PIPELINE
 # ============================================================================
 
@@ -2137,6 +2216,7 @@ def run_pipeline(
     use_llm: bool = True,
     use_images: bool = False,
     use_alpha_vantage: bool = False,
+    use_nolbert: bool = True,  # NEW PARAMETER - default True to include NoLBERT
     n_trials: int = 100,
     n_passes: int = 4,
     max_leakage_retries: int = 3,
@@ -2144,62 +2224,90 @@ def run_pipeline(
 ):
     """
     Execute multi-target short interest prediction pipeline.
-    
+
     Runs pipeline for three target transformations:
     1. Raw short interest
     2. Percentage change
     3. Log transformation
+
+    Args:
+        stock_list: List of stock symbols for features
+        short_stock: Target stock to predict
+        use_llm: Enable LLM feature generation
+        use_images: Send visualizations to LLM
+        use_alpha_vantage: Use Alpha Vantage API instead of Bloomberg
+        use_nolbert: Include NoLBERT NLP sentiment features (NEW)
+        n_trials: Optuna optimization trials
+        n_passes: Number of LLM feature generation passes
+        max_leakage_retries: Maximum retries for leakage errors
+        use_pruning: Enable feature pruning before training
     """
     print("="*70)
     print("MULTI-TARGET SHORT INTEREST PREDICTION PIPELINE")
     print("Models: XGBoost + Ridge | Targets: Raw, Pct Change, Log Change")
     print("="*70)
-    
+
     # 1. Load target data
     print(f"\n1. Loading short interest data for {short_stock}...")
     short_df = get_finra_short_data(short_stock)
-    print(f" ✓ Found {len(short_df)} biweekly measurements")
-    
+    print(f"   ✓ Found {len(short_df)} biweekly measurements")
+
     # 2. Load daily data
     print(f"\n2. Loading daily stock data...")
     stock_dict = {}
-    for stock in tqdm(stock_list, desc=" Processing"):
+    for stock in tqdm(stock_list, desc="   Processing"):
         try:
             stock_dict[stock] = get_stock_data(stock, use_alpha_vantage=use_alpha_vantage)
         except Exception as e:
-            print(f" ⚠ Skipping {stock}: {e}")
-    
+            print(f"   ⚠ Skipping {stock}: {e}")
+
     if not stock_dict:
         raise RuntimeError("No stock data loaded")
-    
+
+    # Initial master DataFrame without NoLBERT
     daily_master = create_daily_master_df(stock_dict=stock_dict)
-    print(f" ✓ Master DataFrame: {daily_master.shape}")
-    
+    print(f"   ✓ Master DataFrame (without NoLBERT): {daily_master.shape}")
+
+    # NEW: Load NoLBERT data if enabled
+    if use_nolbert:
+        print(f"\n3. Loading NoLBERT NLP sentiment data for {short_stock}...")
+        nolbert_df = load_nolbert_data(short_stock)
+
+        if not nolbert_df.empty:
+            # Recreate master dataframe with NoLBERT data
+            daily_master = create_daily_master_df(stock_dict=stock_dict, nolbert_df=nolbert_df)
+            print(f"   ✓ Updated Master DataFrame with NoLBERT: {daily_master.shape}")
+            print(f"   ✓ NoLBERT features available for LLM and models")
+        else:
+            print(f"   ⚠ Proceeding without NoLBERT data")
+    else:
+        print(f"\n3. NoLBERT sentiment data disabled (use --use-nolbert to enable)")
+
     # 3. Generate visualizations if image mode
     if use_llm and use_images:
+        print(f"\n4. Generating visualizations for LLM...")
         visualize_data_for_llm(daily_master, stock_list, short_stock)
-    
+
     # 4. Create target variants
-    print(f"\n3. Creating target variants...")
+    print(f"\n5. Creating target variants...")
     target_variants = create_target_variants(short_df)
     target_labels = {
         'raw': 'Raw Short Interest',
         'pct_change': 'Percentage Change',
         'log_change': 'Log Change'
     }
-    
+
     # 5. Run pipeline for each target
     all_results = {}
     cutoff_dates = {}
-    
+
     for target_type in ['raw', 'pct_change', 'log_change']:
         target_label = target_labels[target_type]
-        
         try:
             results = run_pipeline_for_target(
                 target_type=target_type,
                 target_label=target_label,
-                daily_master=daily_master,
+                daily_master=daily_master,  # This now includes NoLBERT features if enabled
                 short_df_variant=target_variants[target_type],
                 stock_list=stock_list,
                 short_stock=short_stock,
@@ -2210,26 +2318,24 @@ def run_pipeline(
                 max_leakage_retries=max_leakage_retries,
                 use_pruning=use_pruning
             )
-            
             all_results[target_type] = results
             cutoff_dates[target_type] = results['xgb']['cutoff_date']
-            
         except Exception as e:
-            print(f"\n ⚠ ERROR processing {target_label}: {e}")
+            print(f"\n   ⚠ ERROR processing {target_label}: {e}")
             continue
-    
+
     # 6. Create comparative plots
     print("\n" + "="*70)
     print("CREATING COMPARATIVE VISUALIZATIONS")
     print("="*70)
-    
+
     if all_results:
         plot_comparative_results(all_results, short_stock, cutoff_dates, OUTPUT_DIR)
-    
+
     # Cleanup
     if use_images:
         clear_generated_artifacts(stock_list, short_stock)
-    
+
     print("\n" + "="*70)
     print("MULTI-TARGET PIPELINE COMPLETE")
     print("="*70)
@@ -2246,33 +2352,47 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python full_pipeline.py --use-llm
-  python full_pipeline.py --use-llm --use-images
-  python full_pipeline.py --use-llm --use-alpha-vantage --n-trials 20
+    # With NoLBERT (default):
+    python full_pipeline.py --use-llm
+
+    # Without NoLBERT:
+    python full_pipeline.py --use-llm --no-nolbert
+
+    # With NoLBERT and custom settings:
+    python full_pipeline.py --use-llm --use-nolbert --n-trials 50
+
+    # With images and NoLBERT:
+    python full_pipeline.py --use-llm --use-images --use-nolbert
 """
     )
-    
+
     parser.add_argument('--use-llm', action='store_true',
                         help='Enable LLM feature generation (required)')
     parser.add_argument('--use-images', action='store_true',
                         help='Send visualizations to LLM (uses more tokens)')
     parser.add_argument('--use-alpha-vantage', action='store_true',
                         help='Use Alpha Vantage API instead of Bloomberg file')
+
+    # NEW: NoLBERT arguments
+    parser.add_argument('--use-nolbert', action='store_true', default=True,
+                        help='Include NoLBERT NLP sentiment features (default: enabled)')
+    parser.add_argument('--no-nolbert', dest='use_nolbert', action='store_false',
+                        help='Disable NoLBERT NLP sentiment features')
+
     parser.add_argument('--n-trials', type=int, default=100,
                         help='Optuna optimization trials (default: 100)')
     parser.add_argument('--n-passes', type=int, default=3,
                         help='Number of LLM feature generation passes (default: 3)')
     parser.add_argument('--use-pruning', action='store_true',
                         help='Enable feature pruning before training (default: disabled)')
-    
+
     args = parser.parse_args()
-    
+
     # User input for market index
     print("Available market indices: SPX (S&P 500), RUI (Russell 1000), RUA (Russell 3000)")
     market_index = input("Enter market index to use (default: SPX): ").strip().upper()
     if not market_index:
         market_index = "SPX"
-    
     if market_index not in ["SPX", "RUI", "RUA"]:
         print(f"Warning: {market_index} not recognized. Using SPX as default.")
         market_index = "SPX"
@@ -2281,21 +2401,22 @@ Examples:
     stock_list = input("Enter stock symbols separated by commas (e.g., AAPL,MSFT,GOOGL): ").split(',')
     stock_list = [s.strip().upper() for s in stock_list]
 
-# Add selected market index to stock list
+    # Add selected market index to stock list
     if market_index not in stock_list:
         stock_list.append(market_index)
         print(f"Added {market_index} to feature stock list")
-        
-        short_stock = input("Enter stock to predict short interest for (e.g., TSLA): ").strip().upper()
-        
-        # Run pipeline
-        run_pipeline(
-            stock_list=stock_list,
-            short_stock=short_stock,
-            use_llm=args.use_llm,
-            use_images=args.use_images,
-            use_alpha_vantage=args.use_alpha_vantage,
-            n_trials=args.n_trials,
-            n_passes=args.n_passes,
-            use_pruning=args.use_pruning
-        )
+
+    short_stock = input("Enter stock to predict short interest for (e.g., TSLA): ").strip().upper()
+
+    # Run pipeline
+    run_pipeline(
+        stock_list=stock_list,
+        short_stock=short_stock,
+        use_llm=args.use_llm,
+        use_images=args.use_images,
+        use_alpha_vantage=args.use_alpha_vantage,
+        use_nolbert=args.use_nolbert,  # NEW PARAMETER
+        n_trials=args.n_trials,
+        n_passes=args.n_passes,
+        use_pruning=args.use_pruning
+    )
